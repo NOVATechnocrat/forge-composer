@@ -1,5 +1,7 @@
 //! gateway — OpenAI-compatible streaming chat adapter with tool-call support,
-//! plus a unified `chat()` entry point (Anthropic arm lands in Task 5).
+//! plus an Anthropic Messages adapter behind one `chat()` entry point.
+
+pub mod anthropic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ProviderKind {
@@ -83,7 +85,7 @@ pub async fn chat(
 ) -> anyhow::Result<ChatResult> {
     match cfg.kind {
         ProviderKind::OpenAI => chat_stream(cfg, messages, tools, on_delta).await,
-        ProviderKind::Anthropic => anyhow::bail!("anthropic adapter lands in task 5"),
+        ProviderKind::Anthropic => anthropic::chat_anthropic(cfg, messages, tools, on_delta).await,
     }
 }
 
