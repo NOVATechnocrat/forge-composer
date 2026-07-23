@@ -35,7 +35,10 @@ Two components:
 
 ## Status
 
-M0 (Spine) in progress. Not yet usable.
+M0 (Spine) + M1 (Hands) loop-gated. Dogfood via `bash scripts/dogfood-codium.sh`
+(isolated VSCodium profile — does not touch your Cursor session).
+
+M2 (Orchestra) is next.
 
 ## License
 
