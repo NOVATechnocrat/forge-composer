@@ -372,6 +372,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       e.kind === "resume" ||
       e.kind === "interrupt" ||
       e.kind === "budget" ||
+      e.kind === "verdict" ||
+      e.kind === "error" ||
       (e.kind === "message" && e.actor === "human") ||
       (e.kind === "message" &&
         typeof e.actor === "string" &&
@@ -546,6 +548,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .event-card.budget {
     border-color: var(--vscode-inputValidation-errorBorder);
     color: var(--vscode-errorForeground);
+  }
+  .event-card.verdict.pass {
+    border-left: 3px solid var(--vscode-testing-iconPassed);
+    color: var(--vscode-testing-iconPassed);
+  }
+  .event-card.verdict.fail {
+    border-left: 3px solid var(--vscode-errorForeground);
+    color: var(--vscode-errorForeground);
+  }
+  .event-card.verdict .journal-path {
+    margin-top: 0.35rem;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.85em;
+    opacity: 0.65;
+    color: var(--vscode-foreground);
+    word-break: break-all;
   }
   .event-card.report {
     border-left: 3px solid var(--vscode-textLink-foreground);
@@ -963,6 +981,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           "budget exceeded: $" + spent + " ≥ $" + limit + " — paused";
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "verdict") {
+        const decision = String(body.decision ?? "?");
+        const oracleId = String(body.oracle_id ?? "?");
+        const passed = decision === "pass";
+        const el = document.createElement("div");
+        el.className = "event-card verdict " + (passed ? "pass" : "fail");
+        const label = document.createElement("div");
+        label.textContent =
+          "⚖ verdict: " + decision + " — " + oracleId;
+        el.appendChild(label);
+        if (body.journal_path) {
+          const pathEl = document.createElement("div");
+          pathEl.className = "journal-path";
+          pathEl.textContent = String(body.journal_path);
+          el.appendChild(pathEl);
+        }
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "error") {
+        if (body.escalated_to) {
+          const el = document.createElement("div");
+          el.className = "event-muted";
+          el.textContent =
+            "↷ escalated to " +
+            body.escalated_to +
+            ": " +
+            (body.error || "");
+          messagesEl.appendChild(el);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
         return;
       }
 
