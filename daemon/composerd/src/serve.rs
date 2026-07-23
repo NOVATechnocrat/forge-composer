@@ -29,6 +29,7 @@ pub async fn bind_and_serve(
         channels: std::sync::Mutex::new(std::collections::HashMap::new()),
         approvals: std::sync::Mutex::new(std::collections::HashMap::new()),
         controls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        budget_overrides: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let port = port_override.unwrap_or(cfg.server.port);

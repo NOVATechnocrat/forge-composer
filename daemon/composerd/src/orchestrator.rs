@@ -183,8 +183,16 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
             return Ok(());
         }
 
-        // Hard budget: pause-and-ask before spending more.
-        if let Some(limit) = state.cfg.budgets.session_usd {
+        // Hard budget: pause-and-ask before spending more. A per-session human
+        // override (raised via /budget) takes precedence over the config cap.
+        let base_limit = state.cfg.budgets.session_usd;
+        let override_limit = state
+            .budget_overrides
+            .lock()
+            .unwrap()
+            .get(session)
+            .copied();
+        if let Some(limit) = override_limit.or(base_limit) {
             let ledger_spend = session_spend(&state.store.read(session, 0)?);
             let turn_spend = crate::config::cost_usd(
                 &state.cfg, &model_name, total_prompt, total_completion).unwrap_or(0.0);
