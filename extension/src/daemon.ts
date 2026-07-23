@@ -7,6 +7,18 @@ export interface DaemonInfo {
   token: string;
 }
 
+export interface SessionDetail {
+  id: string;
+  kind: string;
+  parent: string | null;
+  role: string;
+  title: string | null;
+  status: "running" | "paused" | "idle";
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+}
+
 function stateDir(): string {
   return (
     process.env.FORGE_COMPOSER_STATE_DIR ??
@@ -120,6 +132,87 @@ export class DaemonClient {
     );
     if (!res.ok) {
       throw new Error(`sendMessage failed: ${res.status}`);
+    }
+  }
+
+  async sessionsDetail(): Promise<SessionDetail[]> {
+    const res = await fetch(`${this.baseUrl}/sessions/detail`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(`sessionsDetail failed: ${res.status}`);
+    }
+    const data = (await res.json()) as { sessions?: SessionDetail[] };
+    return Array.isArray(data.sessions) ? data.sessions : [];
+  }
+
+  async pause(session: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/pause`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: "{}",
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`pause failed: ${res.status}`);
+    }
+  }
+
+  async resume(session: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/resume`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: "{}",
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`resume failed: ${res.status}`);
+    }
+  }
+
+  async steer(session: string, text: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/steer`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ text }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`steer failed: ${res.status}`);
+    }
+  }
+
+  async inject(session: string, text: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/inject`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ text }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`inject failed: ${res.status}`);
+    }
+  }
+
+  async interrupt(session: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/interrupt`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: "{}",
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`interrupt failed: ${res.status}`);
     }
   }
 
