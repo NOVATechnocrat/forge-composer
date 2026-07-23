@@ -1,11 +1,13 @@
 import * as vscode from "vscode";
+import { ChatViewProvider } from "./chatView";
 
 export function activate(context: vscode.ExtensionContext) {
+  const provider = new ChatViewProvider(context);
+
   context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("forgeComposer.chat", provider),
     vscode.commands.registerCommand("forgeComposer.open", () => {
-      vscode.window.showInformationMessage(
-        "Forge Composer M0 scaffold — daemon connection lands in M0 build."
-      );
+      void vscode.commands.executeCommand("forgeComposer.chat.focus");
     })
   );
 }
