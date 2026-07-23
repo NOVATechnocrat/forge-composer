@@ -28,8 +28,11 @@ pub struct AppState {
     pub token: String,
     pub store: ledger::SessionStore,
     pub cfg: crate::config::Config,
+    pub state_dir: std::path::PathBuf,
     pub channels:
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Frame>>>,
+    pub approvals:
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
 }
 
 #[derive(Clone)]
@@ -77,6 +80,10 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/events", get(events))
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/message", post(post_message))
+        .route("/sessions/{id}/approve", post(approve))
+        .route("/sessions/{id}/checkpoints", get(checkpoints))
+        .route("/sessions/{id}/restore", post(restore))
+        .route("/sessions/{id}/file_at", get(file_at))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -110,13 +117,27 @@ pub async fn auth_middleware(
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+pub struct CreateSessionBody {
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
 async fn create_session(
     State(state): State<Arc<AppState>>,
+    body: Option<axum::Json<CreateSessionBody>>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let workspace = body
+        .and_then(|b| b.0.workspace)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let id = state
         .store
         .create_session()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let meta = crate::state::SessionMeta { workspace };
+    let _ = crate::state::write_meta(&state.state_dir, &id, &meta);
     Ok(axum::Json(serde_json::json!({"id": id})))
 }
 
@@ -183,7 +204,15 @@ async fn stream(
 
 #[derive(Deserialize)]
 pub struct MessageBody {
-    text: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Option<Vec<Attachment>>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct Attachment {
+    pub path: String,
 }
 
 async fn post_message(
@@ -194,18 +223,112 @@ async fn post_message(
     if !state.store.session_exists(&id) {
         return Err((StatusCode::NOT_FOUND, "unknown session".into()));
     }
+    let mut msg_body = serde_json::json!({"text": body.text});
+    if let Some(atts) = &body.attachments {
+        if !atts.is_empty() {
+            msg_body["attachments"] = serde_json::json!(atts);
+        }
+    }
     let ev = state
-        .append_event(
-            &id,
-            "human",
-            "message",
-            "trusted",
-            serde_json::json!({"text": body.text}),
-        )
+        .append_event(&id, "human", "message", "trusted", msg_body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let st = state.clone();
+    let idc = id.clone();
     tokio::spawn(async move {
-        crate::orchestrator::run_turn(st, id).await;
+        crate::orchestrator::run_turn(st, idc).await;
     });
     Ok(axum::Json(serde_json::json!({"seq": ev.seq})))
+}
+
+#[derive(Deserialize)]
+pub struct ApproveBody {
+    pub id: String,
+    pub approved: bool,
+}
+
+async fn approve(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    body: axum::Json<ApproveBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&session) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let tx = {
+        let mut map = state.approvals.lock().unwrap();
+        map.remove(&body.id)
+    };
+    let tx = match tx {
+        Some(t) => t,
+        None => return Err((StatusCode::NOT_FOUND, "unknown approval id".into())),
+    };
+    let _ = state.append_event(
+        &session,
+        "system",
+        "approval_decision",
+        "trusted",
+        serde_json::json!({"id": body.id, "approved": body.approved, "by": "human"}),
+    );
+    let _ = tx.send(body.approved);
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn checkpoints(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let (shadow, _jail) = crate::orchestrator::session_shadow(&state, &session)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let list = shadow
+        .list()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let arr: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|(hash, label)| serde_json::json!({"hash": hash, "label": label}))
+        .collect();
+    Ok(axum::Json(serde_json::json!({"checkpoints": arr})))
+}
+
+#[derive(Deserialize)]
+pub struct RestoreBody {
+    pub hash: String,
+}
+
+async fn restore(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    body: axum::Json<RestoreBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let (shadow, _jail) = crate::orchestrator::session_shadow(&state, &session)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    shadow
+        .restore(&body.hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.append_event(
+        &session,
+        "system",
+        "message",
+        "trusted",
+        serde_json::json!({"text": format!("restored checkpoint {}", body.hash)}),
+    );
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+pub struct FileAtQuery {
+    pub hash: String,
+    pub path: String,
+}
+
+async fn file_at(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    Query(q): Query<FileAtQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let (shadow, _jail) = crate::orchestrator::session_shadow(&state, &session)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match shadow.file_at(&q.hash, &q.path) {
+        Ok(content) => Ok(([(header::CONTENT_TYPE, "text/plain")], content).into_response()),
+        Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
+    }
 }

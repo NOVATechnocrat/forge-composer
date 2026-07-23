@@ -4,6 +4,8 @@ pub mod fs_tools;
 pub mod shadow;
 pub mod terminal;
 
+pub use shadow::Shadow;
+
 use std::path::{Path, PathBuf};
 
 /// A canonicalized workspace root that all tool paths are confined to.

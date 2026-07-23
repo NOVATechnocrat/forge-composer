@@ -219,7 +219,7 @@ fn hard_deny(argv: &[String]) -> Option<String> {
 fn is_readonly(argv: &[String]) -> bool {
     const READONLY: &[&str] = &[
         "ls", "pwd", "rg", "grep", "find", "wc", "head", "tail", "cat", "file",
-        "stat", "which", "echo",
+        "stat", "which",
     ];
     if let Some(first) = argv.first() {
         if READONLY.contains(&first.as_str()) {

@@ -8,6 +8,8 @@ pub struct Config {
     pub server: ServerCfg,
     pub providers: BTreeMap<String, ProviderCfg>,
     pub roles: BTreeMap<String, RoleCfg>,
+    #[serde(default)]
+    pub policy: PolicyCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -19,12 +21,38 @@ pub struct ServerCfg {
 pub struct ProviderCfg {
     pub base_url: String,
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RoleCfg {
     pub provider: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PolicyCfg {
+    #[serde(default)]
+    pub auto_approve_edits: bool,
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout_secs: u64,
+    #[serde(default)]
+    pub rules: Vec<policy::Rule>,
+}
+
+impl Default for PolicyCfg {
+    fn default() -> Self {
+        Self {
+            auto_approve_edits: false,
+            approval_timeout_secs: default_approval_timeout(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+fn default_approval_timeout() -> u64 {
+    300
 }
 
 const DEFAULT_CONFIG: &str = r#"[server]
@@ -77,7 +105,11 @@ pub fn resolve_role(cfg: &Config, role: &str) -> anyhow::Result<gateway::Provide
         base_url: provider.base_url.clone(),
         model: role_cfg.model.clone(),
         api_key,
-        kind: gateway::ProviderKind::OpenAI,
+        kind: match provider.kind.as_str() {
+            "" | "openai" => gateway::ProviderKind::OpenAI,
+            "anthropic" => gateway::ProviderKind::Anthropic,
+            other => anyhow::bail!("unknown provider kind: {other}"),
+        },
     })
 }
 
@@ -95,6 +127,16 @@ pub fn secrets(cfg: &Config) -> Vec<String> {
         }
     }
     out
+}
+
+/// Every configured `api_key_env` name (whether or not currently set) — the
+/// terminal executor scrubs these from child envs in addition to the
+/// KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL name match.
+pub fn api_key_env_names(cfg: &Config) -> Vec<String> {
+    cfg.providers
+        .values()
+        .filter_map(|p| p.api_key_env.clone())
+        .collect()
 }
 
 #[cfg(test)]

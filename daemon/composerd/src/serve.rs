@@ -25,7 +25,9 @@ pub async fn bind_and_serve(
         token,
         store,
         cfg: cfg.clone(),
+        state_dir: dir.to_path_buf(),
         channels: std::sync::Mutex::new(std::collections::HashMap::new()),
+        approvals: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let port = port_override.unwrap_or(cfg.server.port);

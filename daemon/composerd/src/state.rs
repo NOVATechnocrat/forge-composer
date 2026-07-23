@@ -59,6 +59,33 @@ pub fn write_daemon_json(dir: &Path, port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-session metadata persisted at `<state_dir>/sessions/<id>/meta.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionMeta {
+    pub workspace: PathBuf,
+}
+
+/// Write a session's `meta.json` (idempotent overwrite).
+pub fn write_meta(state_dir: &Path, session: &str, meta: &SessionMeta) -> anyhow::Result<()> {
+    let dir = state_dir.join("sessions").join(session);
+    std::fs::create_dir_all(&dir)?;
+    let bytes = serde_json::to_vec(meta)?;
+    std::fs::write(dir.join("meta.json"), bytes)?;
+    Ok(())
+}
+
+/// Load a session's `meta.json`. Returns `Ok(None)` if the session dir exists
+/// but has no meta.json (e.g. an M0-era session).
+pub fn load_meta(state_dir: &Path, session: &str) -> anyhow::Result<Option<SessionMeta>> {
+    let path = state_dir.join("sessions").join(session).join("meta.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)?;
+    let meta: SessionMeta = serde_json::from_slice(&bytes)?;
+    Ok(Some(meta))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

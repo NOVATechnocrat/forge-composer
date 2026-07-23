@@ -65,6 +65,11 @@ impl SessionStore {
         self.root.join(session)
     }
 
+    /// Absolute path of a session's directory (the dir holding `ledger.jsonl`).
+    pub fn dir(&self, session: &str) -> PathBuf {
+        self.session_dir(session)
+    }
+
     fn ledger_path(&self, session: &str) -> PathBuf {
         self.session_dir(session).join("ledger.jsonl")
     }
