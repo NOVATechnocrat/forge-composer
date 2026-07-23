@@ -127,6 +127,7 @@ pub fn has_pending_input(events: &[ledger::Event]) -> bool {
 pub async fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/sessions", post(create_session).get(list_sessions))
+        .route("/sessions/detail", get(sessions_detail))
         .route("/sessions/{id}/events", get(events))
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/message", post(post_message))
@@ -204,6 +205,49 @@ async fn list_sessions(
         .list_sessions()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::Json(serde_json::json!({"sessions": sessions})))
+}
+
+async fn sessions_detail(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let ids = state
+        .store
+        .list_sessions()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut out = Vec::new();
+    for id in ids {
+        let meta = crate::state::load_meta(&state.state_dir, &id).ok().flatten();
+        let events = state.store.read(&id, 0).unwrap_or_default();
+        let (mut p, mut c, mut cost) = (0u64, 0u64, 0f64);
+        for e in events.iter().filter(|e| e.kind == "usage") {
+            p += e.body.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            c += e.body.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            cost += e.body.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }
+        let status = if state.is_running(&id) {
+            "running"
+        } else if state
+            .control_for(&id)
+            .paused
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            "paused"
+        } else {
+            "idle"
+        };
+        out.push(serde_json::json!({
+            "id": id,
+            "kind": meta.as_ref().map(|m| m.kind.clone()).unwrap_or_else(|| "orchestrator".into()),
+            "parent": meta.as_ref().and_then(|m| m.parent.clone()),
+            "role": meta.as_ref().map(|m| m.role.clone()).unwrap_or_else(|| "orchestrator".into()),
+            "title": meta.as_ref().and_then(|m| m.title.clone()),
+            "status": status,
+            "prompt_tokens": p,
+            "completion_tokens": c,
+            "cost_usd": cost,
+        }));
+    }
+    Ok(axum::Json(serde_json::json!({"sessions": out})))
 }
 
 #[derive(serde::Deserialize)]
