@@ -31,16 +31,17 @@ Two components:
 ## Design of record
 
 - Spec: [`docs/superpowers/specs/2026-07-22-forge-composer-design.md`](docs/superpowers/specs/2026-07-22-forge-composer-design.md)
-- Roadmap: M0 Spine → M1 Hands → M2 Orchestra → M3 Physics → M4 Ship (spec §12)
+- Roadmap: M0 Spine → M1 Hands → M2 Orchestra → M3 Physics → M4 Cockpit → M5 Ship (spec §12)
 
 ## Status
 
-M0 (Spine) + M1 (Hands) + M2 (Orchestra) + M3 (Physics) + M4 (Cockpit)
+M0 (Spine) + M1 (Hands) + M2 (Orchestra) + M3 (Physics) + M4 (Cockpit) + M5 (Ship)
 loop-gated. Dogfood via `bash scripts/dogfood-codium.sh` (isolated VSCodium
 profile — does not touch your Cursor session).
 
-M5 (Ship — packaging, first-run, model selector + context indicator, live
-end-to-end demo) is next.
+Distributable build: `bash scripts/package.sh` produces `dist/composerd`
+(release daemon) and `dist/forge-composer-<version>.vsix`. First run:
+`composerd init --dir <workspace>` bootstraps a `config.toml`.
 
 ## License
 
