@@ -58,11 +58,13 @@ export class DaemonClient {
     };
   }
 
-  async createSession(): Promise<string> {
+  async createSession(workspace?: string): Promise<string> {
+    const body =
+      workspace !== undefined ? JSON.stringify({ workspace }) : "{}";
     const res = await fetch(`${this.baseUrl}/sessions`, {
       method: "POST",
       headers: this.headers({ "Content-Type": "application/json" }),
-      body: "{}",
+      body,
     });
     if (!res.ok) {
       throw new Error(`createSession failed: ${res.status}`);
@@ -97,18 +99,88 @@ export class DaemonClient {
     return Array.isArray(data.events) ? data.events : [];
   }
 
-  async sendMessage(session: string, text: string): Promise<void> {
+  async sendMessage(
+    session: string,
+    text: string,
+    attachments?: { path: string }[]
+  ): Promise<void> {
+    const payload: { text: string; attachments?: { path: string }[] } = {
+      text,
+    };
+    if (attachments && attachments.length > 0) {
+      payload.attachments = attachments;
+    }
     const res = await fetch(
       `${this.baseUrl}/sessions/${encodeURIComponent(session)}/message`,
       {
         method: "POST",
         headers: this.headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ text }),
+        body: JSON.stringify(payload),
       }
     );
     if (!res.ok) {
       throw new Error(`sendMessage failed: ${res.status}`);
     }
+  }
+
+  async approve(
+    session: string,
+    id: string,
+    approved: boolean
+  ): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/approve`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ id, approved }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`approve failed: ${res.status}`);
+    }
+  }
+
+  async checkpoints(
+    session: string
+  ): Promise<{ hash: string; label: string }[]> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/checkpoints`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) {
+      throw new Error(`checkpoints failed: ${res.status}`);
+    }
+    const data = (await res.json()) as {
+      checkpoints?: { hash: string; label: string }[];
+    };
+    return Array.isArray(data.checkpoints) ? data.checkpoints : [];
+  }
+
+  async restore(session: string, hash: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/restore`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ hash }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`restore failed: ${res.status}`);
+    }
+  }
+
+  async fileAt(session: string, hash: string, path: string): Promise<string> {
+    const params = new URLSearchParams({ hash, path });
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(session)}/file_at?${params}`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) {
+      throw new Error(`fileAt failed: ${res.status}`);
+    }
+    return res.text();
   }
 
   stream(

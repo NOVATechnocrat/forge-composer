@@ -1,11 +1,6 @@
 import * as vscode from "vscode";
 import { DaemonClient, discover } from "./daemon";
 
-interface ChatMessage {
-  role: "user" | "assistant";
-  text: string;
-}
-
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private client?: DaemonClient;
@@ -35,9 +30,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.client = new DaemonClient(info);
     webviewView.webview.html = this.chatHtml();
 
-    webviewView.webview.onDidReceiveMessage((msg: { type?: string; text?: string }) => {
+    webviewView.webview.onDidReceiveMessage((msg: {
+      type?: string;
+      text?: string;
+      requestId?: string;
+      approved?: boolean;
+    }) => {
       if (msg.type === "send" && typeof msg.text === "string") {
         void this.handleSend(msg.text);
+      } else if (
+        msg.type === "approve" &&
+        typeof msg.requestId === "string" &&
+        typeof msg.approved === "boolean"
+      ) {
+        void this.handleApprove(msg.requestId, msg.approved);
       }
     });
 
@@ -50,18 +56,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.initSession(webviewView.webview);
   }
 
+  getSession(): string | undefined {
+    return this.session;
+  }
+
+  getClient(): DaemonClient | undefined {
+    return this.client;
+  }
+
   private async initSession(webview: vscode.Webview): Promise<void> {
     if (!this.client) {
       return;
     }
 
     try {
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       const sessions = await this.client.listSessions();
       this.session =
-        sessions.length > 0 ? sessions[0]! : await this.client.createSession();
+        sessions.length > 0
+          ? sessions[0]!
+          : await this.client.createSession(workspaceFolder);
 
       const events = await this.client.events(this.session, 0);
-      webview.postMessage({ type: "init", messages: eventsToMessages(events) });
+      webview.postMessage({ type: "init", session: this.session, events });
 
       this.disposeStream?.();
       this.disposeStream = this.client.stream(
@@ -100,19 +117,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private onLedger(e: {
-    kind?: string;
-    actor?: string;
-    body?: { text?: string };
-  }): void {
-    if (!this.view || e.kind !== "message") {
+  private async handleApprove(
+    requestId: string,
+    approved: boolean
+  ): Promise<void> {
+    if (!this.client || !this.session || !this.view) {
       return;
     }
 
-    const text = e.body?.text ?? "";
-    if (e.actor === "orchestrator") {
+    try {
+      await this.client.approve(this.session, requestId, approved);
+    } catch (err) {
+      this.view.webview.postMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "approve failed",
+      });
+    }
+  }
+
+  private onLedger(e: {
+    kind?: string;
+    actor?: string;
+    body?: Record<string, unknown>;
+  }): void {
+    if (!this.view) {
+      return;
+    }
+
+    if (e.kind === "message" && e.actor === "orchestrator") {
       this.pendingDelta = "";
-      this.view.webview.postMessage({ type: "assistantMessage", text });
+      this.view.webview.postMessage({
+        type: "assistantMessage",
+        text: (e.body?.text as string) ?? "",
+      });
+      return;
+    }
+
+    if (
+      e.kind === "tool_call" ||
+      e.kind === "tool_result" ||
+      e.kind === "approval_request" ||
+      e.kind === "approval_decision" ||
+      e.kind === "usage" ||
+      (e.kind === "message" && e.actor === "human")
+    ) {
+      this.view.webview.postMessage({ type: "event", event: e });
     }
   }
 
@@ -199,6 +248,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     background: var(--vscode-editor-inactiveSelectionBackground);
   }
   .msg.pending { opacity: 0.75; }
+  .event-card {
+    align-self: stretch;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editor-background);
+    font-size: 0.9em;
+  }
+  .event-card.tool-call {
+    background: var(--vscode-editor-inactiveSelectionBackground);
+  }
+  .event-card.tool-result details summary {
+    cursor: pointer;
+    user-select: none;
+  }
+  .event-card.tool-result.denied {
+    border-color: var(--vscode-inputValidation-errorBorder);
+    color: var(--vscode-errorForeground);
+  }
+  .event-card.tool-result pre {
+    margin: 0.5rem 0 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.85em;
+    max-height: 12rem;
+    overflow-y: auto;
+  }
+  .event-card.approval .summary { margin-bottom: 0.5rem; }
+  .event-card.approval .actions { display: flex; gap: 0.5rem; }
+  .event-card.approval button {
+    padding: 0.25rem 0.75rem;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85em;
+  }
+  .event-card.approval .btn-approve {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .event-card.approval .btn-deny {
+    background: var(--vscode-input-background);
+    color: var(--vscode-foreground);
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .event-card.approval .decision { font-weight: 500; }
+  .event-card.approval .decision.approved { color: var(--vscode-testing-iconPassed); }
+  .event-card.approval .decision.denied { color: var(--vscode-errorForeground); }
+  .event-muted {
+    align-self: stretch;
+    opacity: 0.65;
+    font-size: 0.8em;
+    padding: 0.15rem 0.5rem;
+  }
   #input-area {
     display: flex;
     gap: 0.5rem;
@@ -238,6 +343,134 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("send");
     let pendingEl = null;
+    let sessionId = "";
+
+    function toolCallSummary(body) {
+      const name = body.name || "tool";
+      const args = body.arguments;
+      let summary = "";
+      if (args && typeof args === "object") {
+        const parts = [];
+        for (const [k, v] of Object.entries(args)) {
+          let sv = typeof v === "string" ? v : JSON.stringify(v);
+          if (sv.length > 60) sv = sv.slice(0, 57) + "...";
+          parts.push(k + "=" + sv);
+        }
+        summary = parts.join(", ");
+      } else if (args) {
+        summary = String(args);
+      }
+      return "⚙ " + name + (summary ? " " + summary : "");
+    }
+
+    function toolResultSummary(body) {
+      const name = body.name || "tool";
+      const denied = body.denied === true;
+      const ok = body.ok === true;
+      const prefix = denied ? "⛔ DENIED " : ok ? "✓ " : "✗ ";
+      return prefix + name;
+    }
+
+    function renderEvent(e) {
+      const kind = e.kind;
+      const body = e.body || {};
+
+      if (kind === "message" && e.actor === "human") {
+        addMessage("user", body.text || "", false);
+        return;
+      }
+
+      if (kind === "tool_call") {
+        const el = document.createElement("div");
+        el.className = "event-card tool-call";
+        el.textContent = toolCallSummary(body);
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "tool_result") {
+        const el = document.createElement("div");
+        const denied = body.denied === true;
+        el.className = "event-card tool-result" + (denied ? " denied" : "");
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = toolResultSummary(body);
+        details.appendChild(summary);
+        const pre = document.createElement("pre");
+        pre.textContent = body.output || "";
+        details.appendChild(pre);
+        el.appendChild(details);
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "approval_request") {
+        const el = document.createElement("div");
+        el.className = "event-card approval";
+        el.dataset.requestId = body.id || "";
+        const summaryDiv = document.createElement("div");
+        summaryDiv.className = "summary";
+        summaryDiv.textContent = "Approval required: " + (body.summary || body.tool || "");
+        el.appendChild(summaryDiv);
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const approveBtn = document.createElement("button");
+        approveBtn.className = "btn-approve";
+        approveBtn.textContent = "Approve";
+        approveBtn.addEventListener("click", () => {
+          vscode.postMessage({ type: "approve", requestId: body.id, approved: true });
+          approveBtn.disabled = true;
+          denyBtn.disabled = true;
+        });
+        const denyBtn = document.createElement("button");
+        denyBtn.className = "btn-deny";
+        denyBtn.textContent = "Deny";
+        denyBtn.addEventListener("click", () => {
+          vscode.postMessage({ type: "approve", requestId: body.id, approved: false });
+          approveBtn.disabled = true;
+          denyBtn.disabled = true;
+        });
+        actions.appendChild(approveBtn);
+        actions.appendChild(denyBtn);
+        el.appendChild(actions);
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "approval_decision") {
+        const requestId = body.id || "";
+        const card = messagesEl.querySelector('[data-request-id="' + requestId + '"]');
+        if (card) {
+          const actions = card.querySelector(".actions");
+          if (actions) actions.remove();
+          const decision = document.createElement("div");
+          decision.className = "decision " + (body.approved ? "approved" : "denied");
+          decision.textContent = body.approved ? "✓ approved" : "✗ denied";
+          card.appendChild(decision);
+        } else {
+          const el = document.createElement("div");
+          el.className = "event-muted";
+          el.textContent = body.approved ? "✓ approved" : "✗ denied";
+          messagesEl.appendChild(el);
+        }
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "usage") {
+        const el = document.createElement("div");
+        el.className = "event-muted";
+        const pt = body.prompt_tokens ?? body.input_tokens ?? "?";
+        const ct = body.completion_tokens ?? body.output_tokens ?? "?";
+        el.textContent = "tokens: " + pt + " in / " + ct + " out";
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+    }
 
     function addMessage(role, text, pending) {
       const el = document.createElement("div");
@@ -269,13 +502,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       switch (msg.type) {
         case "init":
           messagesEl.innerHTML = "";
-          for (const m of msg.messages) {
-            addMessage(m.role, m.text, false);
+          sessionId = msg.session || "";
+          for (const e of msg.events || []) {
+            renderEvent(e);
           }
           break;
         case "userMessage":
           clearPending();
           addMessage("user", msg.text, false);
+          break;
+        case "event":
+          renderEvent(msg.event);
           break;
         case "delta":
           updatePending(msg.text);
@@ -309,21 +546,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
-}
-
-function eventsToMessages(events: any[]): ChatMessage[] {
-  const messages: ChatMessage[] = [];
-  for (const e of events) {
-    if (e.kind !== "message") {
-      continue;
-    }
-    if (e.actor === "human") {
-      messages.push({ role: "user", text: e.body?.text ?? "" });
-    } else if (e.actor === "orchestrator") {
-      messages.push({ role: "assistant", text: e.body?.text ?? "" });
-    }
-  }
-  return messages;
 }
 
 function getNonce(): string {
