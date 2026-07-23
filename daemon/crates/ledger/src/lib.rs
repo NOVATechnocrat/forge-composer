@@ -79,6 +79,12 @@ impl SessionStore {
         let id = ulid::Ulid::new().to_string();
         let dir = self.session_dir(&id);
         std::fs::create_dir_all(&dir)?;
+        // Empty ledger so list/events work before the first append (extension
+        // init fetches /events immediately after createSession).
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.ledger_path(&id))?;
         Ok(id)
     }
 
@@ -93,7 +99,9 @@ impl SessionStore {
                 continue;
             }
             if let Some(name) = entry.file_name().to_str() {
-                if self.ledger_path(name).exists() {
+                // A session directory is enough — create_session always leaves a
+                // ledger.jsonl, but tolerate older dirs that only have meta.json.
+                if self.session_exists(name) {
                     out.push(name.to_string());
                 }
             }
@@ -166,9 +174,12 @@ impl SessionStore {
     }
 
     pub fn read(&self, session: &str, since_seq: u64) -> anyhow::Result<Vec<Event>> {
+        if !self.session_exists(session) {
+            anyhow::bail!("unknown session: {session}");
+        }
         let path = self.ledger_path(session);
         if !path.exists() {
-            anyhow::bail!("unknown session: {session}");
+            return Ok(Vec::new());
         }
         let bytes = std::fs::read(&path)?;
         let mut out = Vec::new();
@@ -245,5 +256,14 @@ mod tests {
     fn unknown_session_read_is_error_not_empty() {
         let (_d, s) = store();
         assert!(s.read("01JUNKJUNKJUNKJUNKJUNKJUNK", 0).is_err());
+    }
+
+    #[test]
+    fn fresh_session_lists_and_reads_empty() {
+        let (_d, s) = store();
+        let id = s.create_session().unwrap();
+        assert_eq!(s.list_sessions().unwrap(), vec![id.clone()]);
+        assert!(s.read(&id, 0).unwrap().is_empty());
+        assert!(s.session_dir(&id).join("ledger.jsonl").exists());
     }
 }
