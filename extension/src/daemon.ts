@@ -17,6 +17,15 @@ export interface SessionDetail {
   prompt_tokens: number;
   completion_tokens: number;
   cost_usd: number;
+  model?: string | null;
+  context_window?: number | null;
+  last_prompt_tokens?: number;
+}
+
+export interface RoleInfo {
+  name: string;
+  provider: string;
+  model: string;
 }
 
 function stateDir(): string {
@@ -70,9 +79,15 @@ export class DaemonClient {
     };
   }
 
-  async createSession(workspace?: string): Promise<string> {
-    const body =
-      workspace !== undefined ? JSON.stringify({ workspace }) : "{}";
+  async createSession(workspace?: string, role?: string): Promise<string> {
+    const payload: { workspace?: string; role?: string } = {};
+    if (workspace !== undefined) {
+      payload.workspace = workspace;
+    }
+    if (role !== undefined) {
+      payload.role = role;
+    }
+    const body = JSON.stringify(payload);
     const res = await fetch(`${this.baseUrl}/sessions`, {
       method: "POST",
       headers: this.headers({ "Content-Type": "application/json" }),
@@ -145,6 +160,31 @@ export class DaemonClient {
     }
     const data = (await res.json()) as { sessions?: SessionDetail[] };
     return Array.isArray(data.sessions) ? data.sessions : [];
+  }
+
+  async roles(): Promise<RoleInfo[]> {
+    const res = await fetch(`${this.baseUrl}/roles`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(`roles failed: ${res.status}`);
+    }
+    const data = (await res.json()) as { roles?: RoleInfo[] };
+    return Array.isArray(data.roles) ? data.roles : [];
+  }
+
+  async setRole(id: string, role: string): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(id)}/role`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ role }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`setRole failed: ${res.status}`);
+    }
   }
 
   async pause(session: string): Promise<void> {
