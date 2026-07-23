@@ -51,6 +51,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       action?: string;
       childId?: string;
       limitUsd?: number;
+      role?: string;
     }) => {
       switch (msg.type) {
         case "send":
@@ -107,6 +108,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "pickFile":
           void this.handlePickFile(webviewView.webview);
+          break;
+        case "setRole":
+          if (typeof msg.role === "string") {
+            void this.handleSetRole(msg.role);
+          }
           break;
       }
     });
@@ -178,9 +184,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingDelta = "";
     this.disposeStream?.();
 
-    const [events, details] = await Promise.all([
+    const [events, details, roles] = await Promise.all([
       this.client.events(this.session, 0),
       this.client.sessionsDetail(),
+      this.client.roles(),
     ]);
     const detail = details.find((d) => d.id === this.session);
 
@@ -189,6 +196,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: "init",
       session: this.session,
       kind: detail?.kind ?? "orchestrator",
+      role: detail?.role ?? "orchestrator",
+      model: detail?.model ?? null,
+      contextWindow: detail?.context_window ?? null,
+      lastPromptTokens: detail?.last_prompt_tokens ?? 0,
+      roles,
       events,
     });
 
@@ -197,6 +209,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       (e) => this.onLedger(e),
       (t) => this.onDelta(t)
     );
+  }
+
+  private async handleSetRole(role: string): Promise<void> {
+    if (!this.client || !this.session || !this.view) {
+      return;
+    }
+
+    try {
+      await this.client.setRole(this.session, role);
+    } catch (err) {
+      this.view.webview.postMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "role switch failed",
+      });
+    }
   }
 
   private async handleControl(action: string): Promise<void> {
@@ -520,12 +547,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       e.kind === "adopt" ||
       e.kind === "verdict" ||
       e.kind === "error" ||
+      e.kind === "role_switch" ||
+      e.kind === "rules" ||
       (e.kind === "message" && e.actor === "human") ||
       (e.kind === "message" &&
         typeof e.actor === "string" &&
         e.actor.startsWith("sub:"))
     ) {
       this.view.webview.postMessage({ type: "event", event: e });
+    }
+
+    if (e.kind === "usage") {
+      const pt =
+        typeof e.body?.prompt_tokens === "number"
+          ? e.body.prompt_tokens
+          : typeof e.body?.input_tokens === "number"
+            ? e.body.input_tokens
+            : undefined;
+      if (pt !== undefined) {
+        this.view.webview.postMessage({
+          type: "contextUpdate",
+          lastPromptTokens: pt,
+          model: typeof e.body?.model === "string" ? e.body.model : undefined,
+        });
+      }
+    }
+
+    if (e.kind === "role_switch") {
+      const to = e.body?.to;
+      if (typeof to === "string") {
+        this.view.webview.postMessage({ type: "roleUpdate", role: to });
+      }
     }
   }
 
@@ -767,6 +819,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     color: var(--vscode-badge-foreground);
     font-size: 0.8em;
   }
+  #role-select {
+    padding: 0.15rem 0.35rem;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.85em;
+    max-width: 14rem;
+  }
+  #context-gauge {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-left: auto;
+    font-size: 0.8em;
+    opacity: 0.85;
+  }
+  #context-gauge .gauge-bar {
+    width: 4rem;
+    height: 4px;
+    background: var(--vscode-panel-border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #context-gauge .gauge-fill {
+    height: 100%;
+    background: var(--vscode-progressBar-background);
+    border-radius: 2px;
+    transition: width 0.2s ease;
+  }
+  #context-gauge .gauge-fill.amber {
+    background: var(--vscode-editorWarning-foreground);
+  }
+  #context-gauge .gauge-fill.red {
+    background: var(--vscode-errorForeground);
+  }
   #control-strip button {
     padding: 0.2rem 0.55rem;
     background: var(--vscode-button-secondaryBackground);
@@ -841,10 +930,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="control-strip">
     <span id="session-label"></span>
     <span id="kind-badge"></span>
+    <select id="role-select" title="Model role"></select>
     <button id="btn-pause" type="button">Pause ⏸</button>
     <button id="btn-resume" type="button">Resume ▶</button>
     <button id="btn-steer" type="button">Steer</button>
     <button id="btn-stop" type="button">Stop ■</button>
+    <div id="context-gauge">
+      <span id="context-label"></span>
+      <div class="gauge-bar"><div id="gauge-fill" class="gauge-fill"></div></div>
+    </div>
   </div>
   <div id="attachments"></div>
   <div id="messages"></div>
@@ -859,12 +953,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const attachmentsEl = document.getElementById("attachments");
     const sessionLabelEl = document.getElementById("session-label");
     const kindBadgeEl = document.getElementById("kind-badge");
+    const roleSelectEl = document.getElementById("role-select");
+    const contextLabelEl = document.getElementById("context-label");
+    const gaugeFillEl = document.getElementById("gauge-fill");
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("send");
     const attachBtn = document.getElementById("attach");
     let pendingEl = null;
     let sessionId = "";
     let attachments = [];
+    let currentRole = "orchestrator";
+    let contextWindow = null;
+    let lastPromptTokens = 0;
+    let suppressRoleChange = false;
     const toolCallArgs = {};
     const FILE_LINK_RE = /(~?[\\w./+-]*\\/)?[\\w.+-]+\\.[A-Za-z0-9]{1,8}(:\\d+)?/g;
 
@@ -875,6 +976,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       if (kindBadgeEl) {
         kindBadgeEl.textContent = kind || "orchestrator";
+      }
+    }
+
+    function populateRoleSelect(roles, selectedRole) {
+      if (!roleSelectEl) return;
+      roleSelectEl.innerHTML = "";
+      for (const r of roles || []) {
+        const opt = document.createElement("option");
+        opt.value = r.name;
+        opt.textContent = r.name + " (" + r.model + ")";
+        roleSelectEl.appendChild(opt);
+      }
+      if (selectedRole) {
+        currentRole = selectedRole;
+        suppressRoleChange = true;
+        roleSelectEl.value = selectedRole;
+        suppressRoleChange = false;
+      }
+    }
+
+    function updateContextGauge() {
+      if (!contextLabelEl) return;
+      const pt = lastPromptTokens ?? 0;
+      if (contextWindow && contextWindow > 0) {
+        contextLabelEl.textContent = pt + "/" + contextWindow + " tok";
+        if (gaugeFillEl) {
+          const pct = Math.min(100, (pt / contextWindow) * 100);
+          gaugeFillEl.style.width = pct + "%";
+          gaugeFillEl.classList.remove("amber", "red");
+          if (pct >= 90) {
+            gaugeFillEl.classList.add("red");
+          } else if (pct >= 70) {
+            gaugeFillEl.classList.add("amber");
+          }
+          gaugeFillEl.parentElement.style.display = "";
+        }
+      } else {
+        contextLabelEl.textContent = pt + " tok";
+        if (gaugeFillEl && gaugeFillEl.parentElement) {
+          gaugeFillEl.style.width = "0%";
+          gaugeFillEl.classList.remove("amber", "red");
+          gaugeFillEl.parentElement.style.display = "none";
+        }
       }
     }
 
@@ -1105,6 +1249,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         el.textContent = "tokens: " + pt + " in / " + ct + " out";
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        if (typeof pt === "number") {
+          lastPromptTokens = pt;
+          updateContextGauge();
+        }
+        return;
+      }
+
+      if (kind === "role_switch") {
+        const el = document.createElement("div");
+        el.className = "event-muted";
+        el.textContent =
+          "⇄ role: " + (body.from || "?") + " → " + (body.to || "?");
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        if (body.to) {
+          currentRole = body.to;
+          if (roleSelectEl) {
+            suppressRoleChange = true;
+            roleSelectEl.value = body.to;
+            suppressRoleChange = false;
+          }
+        }
+        return;
+      }
+
+      if (kind === "rules") {
+        const el = document.createElement("div");
+        el.className = "event-muted";
+        const path = body.path || "AGENTS.md";
+        const bytes = body.bytes ?? "?";
+        el.textContent =
+          "☰ workspace rules loaded (" + path + ", " + bytes + " B)";
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
       }
 
@@ -1313,6 +1491,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "init":
           messagesEl.innerHTML = "";
           updateSessionHeader(msg.session || "", msg.kind || "orchestrator");
+          contextWindow =
+            typeof msg.contextWindow === "number" ? msg.contextWindow : null;
+          lastPromptTokens =
+            typeof msg.lastPromptTokens === "number" ? msg.lastPromptTokens : 0;
+          populateRoleSelect(msg.roles || [], msg.role || "orchestrator");
+          updateContextGauge();
           for (const e of msg.events || []) {
             renderEvent(e);
           }
@@ -1342,6 +1526,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "error":
           clearPending();
           addMessage("assistant", "Error: " + msg.text, false);
+          break;
+        case "contextUpdate":
+          if (typeof msg.lastPromptTokens === "number") {
+            lastPromptTokens = msg.lastPromptTokens;
+            updateContextGauge();
+          }
+          break;
+        case "roleUpdate":
+          if (typeof msg.role === "string") {
+            currentRole = msg.role;
+            if (roleSelectEl) {
+              suppressRoleChange = true;
+              roleSelectEl.value = msg.role;
+              suppressRoleChange = false;
+            }
+          }
           break;
       }
     });
@@ -1375,6 +1575,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     document.getElementById("btn-stop").addEventListener("click", () => {
       vscode.postMessage({ type: "control", action: "interrupt" });
     });
+    if (roleSelectEl) {
+      roleSelectEl.addEventListener("change", () => {
+        if (suppressRoleChange) return;
+        const next = roleSelectEl.value;
+        if (!next || next === currentRole) return;
+        currentRole = next;
+        vscode.postMessage({ type: "setRole", role: next });
+      });
+    }
     inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();

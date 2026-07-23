@@ -99,9 +99,13 @@ export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNod
   getTreeItem(element: SessionNode): vscode.TreeItem {
     const d = element.detail;
     const label = d.title ?? d.id.slice(-8);
-    const rolePrefix = d.kind === "subagent" ? `${d.role} · ` : "";
     const totalTok = d.prompt_tokens + d.completion_tokens;
-    const description = `${rolePrefix}${d.status} · ${totalTok} tok · $${d.cost_usd.toFixed(4)}`;
+    const parts = [d.role];
+    if (d.model) {
+      parts.push(d.model);
+    }
+    parts.push(d.status, `${totalTok} tok`, `$${d.cost_usd.toFixed(4)}`);
+    const description = parts.join(" · ");
 
     const icon =
       d.status === "running"
