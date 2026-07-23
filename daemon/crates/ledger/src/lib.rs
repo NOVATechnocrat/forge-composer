@@ -97,6 +97,11 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// True if a session directory exists (regardless of whether it has events yet).
+    pub fn session_exists(&self, session: &str) -> bool {
+        self.session_dir(session).exists()
+    }
+
     fn last_seq(&self, session: &str) -> anyhow::Result<u64> {
         let path = self.ledger_path(session);
         if !path.exists() {
