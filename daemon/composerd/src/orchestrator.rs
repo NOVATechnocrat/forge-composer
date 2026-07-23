@@ -105,7 +105,24 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
     let ctl = state.control_for(session);
 
     let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
-    for ev in events.iter() {
+    // Bounded history fold: keep only the most recent `max_fold_events` foldable
+    // events; when history exceeds the cap, drop the older ones and prepend an
+    // explicit truncation marker so nothing is silently lost.
+    let foldable_kinds: &[&str] = &["steer", "context_inject", "message", "tool_call", "tool_result"];
+    let mut foldable: Vec<&ledger::Event> = events
+        .iter()
+        .filter(|e| foldable_kinds.contains(&e.kind.as_str()))
+        .collect();
+    let cap = state.cfg.context.max_fold_events;
+    if foldable.len() > cap {
+        let dropped = foldable.len() - cap;
+        messages.push(ChatMessage::text(
+            "system",
+            &format!("[earlier history truncated: {dropped} older events not shown]"),
+        ));
+        foldable = foldable.split_off(foldable.len() - cap);
+    }
+    for ev in foldable.iter() {
         rebuild_one(&mut messages, ev, &jail, &agent_actor);
     }
     // No-invisible-interventions (D4): show the orchestrator every human
