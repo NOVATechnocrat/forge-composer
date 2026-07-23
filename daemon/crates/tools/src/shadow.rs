@@ -57,15 +57,36 @@ impl Shadow {
         }
     }
 
-    /// `checkout <hash> -- .` (work-tree files only).
+    /// Revert the work-tree to exactly this checkpoint's tree: load the tree
+    /// into the index, write it to the work-tree, then remove any files added
+    /// after the checkpoint. HEAD is not moved (later checkpoints stay listed).
     pub fn restore(&self, hash: &str) -> anyhow::Result<()> {
-        git_run(&self.git_dir, &self.work_tree, &["checkout", "-q", hash, "--", "."])
+        let tree = format!("{hash}^{{tree}}");
+        git_run(&self.git_dir, &self.work_tree, &["read-tree", &tree])?;
+        git_run(
+            &self.git_dir,
+            &self.work_tree,
+            &["checkout-index", "-f", "-a"],
+        )?;
+        git_run(&self.git_dir, &self.work_tree, &["clean", "-fd"])?;
+        Ok(())
     }
 
     /// `git show hash:rel_path`.
     pub fn file_at(&self, hash: &str, rel_path: &str) -> anyhow::Result<String> {
         let spec = format!("{hash}:{rel_path}");
         git_out(&self.git_dir, &self.work_tree, &["show", &spec])
+    }
+
+    /// Unified diff from the checkpoint's tree to the CURRENT work-tree state
+    /// (what the agent changed since the checkpoint). Stages the current
+    /// work-tree into the shadow index first so new files appear in the patch.
+    /// Unknown hash → Err (caller maps to 404).
+    pub fn diff(&self, hash: &str) -> anyhow::Result<String> {
+        let tree = format!("{hash}^{{tree}}");
+        git_run(&self.git_dir, &self.work_tree, &["cat-file", "-e", &tree])?;
+        git_run(&self.git_dir, &self.work_tree, &["add", "-A"])?;
+        git_out(&self.git_dir, &self.work_tree, &["diff", "--cached", hash])
     }
 }
 

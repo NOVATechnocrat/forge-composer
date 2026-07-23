@@ -140,6 +140,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/checkpoints", get(checkpoints))
         .route("/sessions/{id}/restore", post(restore))
         .route("/sessions/{id}/file_at", get(file_at))
+        .route("/sessions/{id}/diff", get(diff))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -569,6 +570,24 @@ async fn file_at(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match shadow.file_at(&q.hash, &q.path) {
         Ok(content) => Ok(([(header::CONTENT_TYPE, "text/plain")], content).into_response()),
+        Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DiffQuery {
+    pub from: String,
+}
+
+async fn diff(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let (shadow, _jail) = crate::orchestrator::session_shadow(&state, &session)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match shadow.diff(&q.from) {
+        Ok(patch) => Ok(axum::Json(serde_json::json!({"patch": patch}))),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
     }
 }
