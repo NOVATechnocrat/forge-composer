@@ -309,10 +309,22 @@ pub struct MessageBody {
     pub attachments: Option<Vec<Attachment>>,
 }
 
+/// An attachment may be path-based (read from the jail at fold time — the M1
+/// sealed form) or name/content-based (inline data — the M4 form). Both shapes
+/// deserialize; serialization skips absent fields so existing events stay
+/// byte-identical.
 #[derive(Deserialize, serde::Serialize)]
 pub struct Attachment {
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
+
+/// Hard cap on total inline attachment `content` bytes per message (256 KiB).
+const ATTACH_TOTAL_CAP: usize = 262_144;
 
 async fn post_message(
     State(state): State<Arc<AppState>>,
@@ -321,6 +333,19 @@ async fn post_message(
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
     if !state.store.session_exists(&id) {
         return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    if let Some(atts) = &body.attachments {
+        let total: usize = atts
+            .iter()
+            .filter_map(|a| a.content.as_deref())
+            .map(|c| c.len())
+            .sum();
+        if total > ATTACH_TOTAL_CAP {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "attachment content exceeds 262144 bytes".into(),
+            ));
+        }
     }
     let mut msg_body = serde_json::json!({"text": body.text});
     if let Some(atts) = &body.attachments {

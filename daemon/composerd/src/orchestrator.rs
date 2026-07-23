@@ -826,6 +826,13 @@ fn rebuild_one(
                             text.push_str(&format!(
                                 "\n\nAttached file {p}:\n{UNTRUSTED_OPEN}\n{cap}\n{UNTRUSTED_CLOSE}"
                             ));
+                        } else if let (Some(name), Some(content)) = (
+                            att.get("name").and_then(|n| n.as_str()),
+                            att.get("content").and_then(|c| c.as_str()),
+                        ) {
+                            text.push_str(&format!(
+                                "\n\nAttached file: {name}\n{UNTRUSTED_OPEN}\n{content}\n{UNTRUSTED_CLOSE}"
+                            ));
                         }
                     }
                 }
