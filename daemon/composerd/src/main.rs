@@ -7,6 +7,15 @@ fn main() {
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
 
     match sub {
+        "--version" | "-V" => {
+            println!("composerd {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        "init" => {
+            if let Err(code) = cmd_init(&args[2..]) {
+                std::process::exit(code);
+            }
+        }
         "sessions" => {
             if let Err(code) = cmd_sessions() {
                 std::process::exit(code);
@@ -44,7 +53,7 @@ fn main() {
         }
         other => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: {prog} [serve|sessions|ledger <id>|checkpoints <id>]");
+            eprintln!("usage: {prog} [serve|init|sessions|ledger <id>|checkpoints <id>]");
             std::process::exit(2);
         }
     }
@@ -52,6 +61,86 @@ fn main() {
 
 fn state_dir() -> PathBuf {
     composerd::state::state_dir()
+}
+
+/// `composerd init [--dir <state-dir>] [--provider ollama|fireworks]` — write a
+/// starter config.toml ONLY when absent (never clobber; exit nonzero otherwise).
+fn cmd_init(args: &[String]) -> Result<(), i32> {
+    let mut dir = state_dir();
+    let mut provider = "ollama".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                let Some(d) = args.get(i) else {
+                    eprintln!("init: --dir requires a value");
+                    return Err(2);
+                };
+                dir = PathBuf::from(d);
+            }
+            "--provider" => {
+                i += 1;
+                let Some(p) = args.get(i) else {
+                    eprintln!("init: --provider requires a value");
+                    return Err(2);
+                };
+                provider = p.clone();
+            }
+            other => {
+                eprintln!("init: unknown argument: {other}");
+                return Err(2);
+            }
+        }
+        i += 1;
+    }
+    let model = match provider.as_str() {
+        "ollama" => "qwen2.5:14b-instruct",
+        "fireworks" => "accounts/fireworks/models/glm-5p2",
+        other => {
+            eprintln!("init: unknown provider: {other} (expected ollama|fireworks)");
+            return Err(2);
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("init: cannot create state dir {}: {e}", dir.display());
+        return Err(1);
+    }
+    let cfg_path = dir.join("config.toml");
+    if cfg_path.exists() {
+        eprintln!(
+            "init: refusing to clobber existing config: {}",
+            cfg_path.display()
+        );
+        return Err(1);
+    }
+
+    let provider_block = match provider.as_str() {
+        "ollama" => format!(
+            "[providers.ollama]\nbase_url = \"http://127.0.0.1:11434/v1\"\n"
+        ),
+        "fireworks" => format!(
+            "[providers.fireworks]\nbase_url = \"https://api.fireworks.ai/inference/v1\"\napi_key_env = \"FIREWORKS_API_KEY\"\n"
+        ),
+        _ => unreachable!(),
+    };
+    let template = format!(
+        "[server]\nport = 8642\n\n\
+{provider_block}\n\
+# Cursor-parity: auto-apply edits. The safety net is the cockpit — every edit\n\
+# takes a shadow checkpoint, so /diff shows what changed and /restore reverts it.\n\
+[roles.orchestrator]\nprovider = \"{provider}\"\nmodel = \"{model}\"\n\n\
+[roles.coder]\nprovider = \"{provider}\"\nmodel = \"{model}\"\n\n\
+[policy]\nauto_approve_edits = true\n\n\
+# [budgets]\n# session_usd = 5.0\n"
+    );
+    if let Err(e) = std::fs::write(&cfg_path, template) {
+        eprintln!("init: cannot write {}: {e}", cfg_path.display());
+        return Err(1);
+    }
+    println!("{}", cfg_path.display());
+    Ok(())
 }
 
 fn run_serve() -> anyhow::Result<()> {
