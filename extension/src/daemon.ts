@@ -114,11 +114,12 @@ export class DaemonClient {
   async sendMessage(
     session: string,
     text: string,
-    attachments?: { path: string }[]
+    attachments?: { name: string; content: string }[]
   ): Promise<void> {
-    const payload: { text: string; attachments?: { path: string }[] } = {
-      text,
-    };
+    const payload: {
+      text: string;
+      attachments?: { name: string; content: string }[];
+    } = { text };
     if (attachments && attachments.length > 0) {
       payload.attachments = attachments;
     }
@@ -261,6 +262,62 @@ export class DaemonClient {
     );
     if (!res.ok) {
       throw new Error(`restore failed: ${res.status}`);
+    }
+  }
+
+  async diff(id: string, from: string): Promise<{ patch: string }> {
+    const params = new URLSearchParams({ from });
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(id)}/diff?${params}`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) {
+      throw new Error(`diff failed: ${res.status}`);
+    }
+    const data = (await res.json()) as { patch?: string };
+    if (typeof data.patch !== "string") {
+      throw new Error("diff: missing patch");
+    }
+    return { patch: data.patch };
+  }
+
+  async adopt(
+    parentId: string,
+    childId: string
+  ): Promise<{ merge_commit: string }> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(parentId)}/adopt`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ child: childId }),
+      }
+    );
+    if (res.status === 409) {
+      const data = (await res.json()) as { error?: string };
+      throw new Error(data.error ?? "merge conflict");
+    }
+    if (!res.ok) {
+      throw new Error(`adopt failed: ${res.status}`);
+    }
+    const data = (await res.json()) as { merge_commit?: string };
+    if (typeof data.merge_commit !== "string") {
+      throw new Error("adopt: missing merge_commit");
+    }
+    return { merge_commit: data.merge_commit };
+  }
+
+  async raiseBudget(id: string, usd: number): Promise<void> {
+    const res = await fetch(
+      `${this.baseUrl}/sessions/${encodeURIComponent(id)}/budget`,
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ session_usd: usd }),
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`raiseBudget failed: ${res.status}`);
     }
   }
 
