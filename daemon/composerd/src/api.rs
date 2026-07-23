@@ -136,7 +136,7 @@ async fn create_session(
         .store
         .create_session()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let meta = crate::state::SessionMeta { workspace };
+    let meta = crate::state::SessionMeta::orchestrator(workspace);
     let _ = crate::state::write_meta(&state.state_dir, &id, &meta);
     Ok(axum::Json(serde_json::json!({"id": id})))
 }

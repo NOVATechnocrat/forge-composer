@@ -63,6 +63,43 @@ pub fn write_daemon_json(dir: &Path, port: u16) -> anyhow::Result<()> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     pub workspace: PathBuf,
+    #[serde(default = "default_kind")]
+    pub kind: String, // "orchestrator" | "subagent"
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default = "default_role")]
+    pub role: String, // key into config [roles.*]
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<PathBuf>,
+}
+
+fn default_kind() -> String {
+    "orchestrator".to_string()
+}
+fn default_role() -> String {
+    "orchestrator".to_string()
+}
+
+impl SessionMeta {
+    /// The path executors are jailed to: the worktree for subagents,
+    /// the workspace for orchestrator sessions.
+    pub fn jail_root(&self) -> &Path {
+        self.worktree.as_deref().unwrap_or(&self.workspace)
+    }
+
+    /// An orchestrator-kind meta for a bare workspace (M0/M1 call sites).
+    pub fn orchestrator(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            kind: default_kind(),
+            parent: None,
+            role: default_role(),
+            title: None,
+            worktree: None,
+        }
+    }
 }
 
 /// Write a session's `meta.json` (idempotent overwrite).
@@ -119,5 +156,34 @@ mod tests {
                 .unwrap();
         assert_eq!(v["port"], 8642);
         assert!(v["pid"].as_u64().is_some());
+    }
+
+    #[test]
+    fn meta_v2_defaults_and_jail_root() {
+        // An M1-era meta.json (workspace only) must still load.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("sessions").join("S1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), br#"{"workspace":"/tmp/ws"}"#).unwrap();
+        let m = load_meta(d.path(), "S1").unwrap().unwrap();
+        assert_eq!(m.kind, "orchestrator");
+        assert_eq!(m.role, "orchestrator");
+        assert!(m.parent.is_none());
+        assert_eq!(m.jail_root(), Path::new("/tmp/ws"));
+
+        // A subagent meta round-trips and jails to the worktree.
+        let sub = SessionMeta {
+            workspace: "/tmp/ws".into(),
+            kind: "subagent".into(),
+            parent: Some("S1".into()),
+            role: "coder".into(),
+            title: Some("child-a".into()),
+            worktree: Some("/tmp/wt".into()),
+        };
+        write_meta(d.path(), "S2", &sub).unwrap();
+        let m2 = load_meta(d.path(), "S2").unwrap().unwrap();
+        assert_eq!(m2.kind, "subagent");
+        assert_eq!(m2.parent.as_deref(), Some("S1"));
+        assert_eq!(m2.jail_root(), Path::new("/tmp/wt"));
     }
 }

@@ -85,9 +85,7 @@ fn checkpoints_readback() {
     composerd::state::write_meta(
         &state,
         &id,
-        &composerd::state::SessionMeta {
-            workspace: ws.clone(),
-        },
+        &composerd::state::SessionMeta::orchestrator(ws.clone()),
     )
     .unwrap();
     // Drive Shadow directly to create one checkpoint.
