@@ -23,6 +23,17 @@ fn frame(output: &str) -> String {
     format!("{UNTRUSTED_OPEN}\n{output}\n{UNTRUSTED_CLOSE}")
 }
 
+/// Next index in the escalation chain after `idx`, or `None` when `idx` is the
+/// last tier (no further escalation). The walk is one bounded pass: each hop
+/// advances by exactly one and never revisits a failed tier.
+fn next_tier(idx: usize, len: usize) -> Option<usize> {
+    if idx + 1 < len {
+        Some(idx + 1)
+    } else {
+        None
+    }
+}
+
 /// Build the (Shadow, Jail) for a session — used by the checkpoint/restore/file_at
 /// routes so they share the orchestrator's notion of the workspace.
 pub fn session_shadow(
@@ -82,8 +93,9 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
     } else {
         "orchestrator".to_string()
     };
-    let cfg = crate::config::resolve_role(&state.cfg, &role)?;
-    let model_name = cfg.model.clone();
+    let chain = crate::config::resolve_chain(&state.cfg, &role)?;
+    let mut tier_idx: usize = 0;
+    let mut model_name = chain[0].1.model.clone();
     let jail = tools::Jail::new(meta.jail_root())?;
     let session_dir = state.store.dir(session);
     let shadow = tools::Shadow::init(&session_dir, meta.jail_root())?;
@@ -172,21 +184,49 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
 
         let state_for_delta = state.clone();
         let session_for_delta = session.to_string();
-        let result = match gateway::chat(&cfg, &messages, Some(&tools_json), |d| {
-            state_for_delta.broadcast(&session_for_delta, crate::api::Frame::Delta(d.to_string()));
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = state.append_event(
-                    session,
-                    "system",
-                    "error",
-                    "trusted",
-                    serde_json::json!({"error": format!("gateway: {e}")}),
-                );
-                return Ok(());
+        // Walk the escalation chain from the current tier: on a transport/HTTP
+        // error, ledger an `error` event with `escalated_to` and try the next
+        // tier; if no tier remains, the terminal error event ends the turn.
+        // Bounded by construction: at most chain.len() attempts, one pass, no
+        // retry of a failed tier within the turn (tier_idx only advances).
+        let result = loop {
+            let tier_cfg = &chain[tier_idx].1;
+            match gateway::chat(tier_cfg, &messages, Some(&tools_json), |d| {
+                state_for_delta.broadcast(&session_for_delta, crate::api::Frame::Delta(d.to_string()));
+            })
+            .await
+            {
+                Ok(r) => {
+                    model_name = tier_cfg.model.clone();
+                    break r;
+                }
+                Err(e) => match next_tier(tier_idx, chain.len()) {
+                    Some(next) => {
+                        let next_role = chain[next].0.clone();
+                        let _ = state.append_event(
+                            session,
+                            "system",
+                            "error",
+                            "trusted",
+                            serde_json::json!({
+                                "error": format!("gateway: {e}"),
+                                "escalated_to": next_role
+                            }),
+                        );
+                        tier_idx = next;
+                        continue;
+                    }
+                    None => {
+                        let _ = state.append_event(
+                            session,
+                            "system",
+                            "error",
+                            "trusted",
+                            serde_json::json!({"error": format!("gateway: {e}")}),
+                        );
+                        return Ok(());
+                    }
+                },
             }
         };
         if let Some(u) = &result.usage {
@@ -796,6 +836,45 @@ mod tests {
         ];
         let total = session_spend(&evs);
         assert!((total - 0.75).abs() < 1e-9, "{total}");
+    }
+
+    #[test]
+    fn chain_walk_order_is_primary_then_escalations_once() {
+        // A chain of 3: simulate Err/Err/Ok and check the attempted order and
+        // final tier index. The walk is one bounded pass — it never revisits a
+        // failed tier and stops at the first Ok.
+        let len = 3;
+        let mut visited = Vec::new();
+        let mut idx = 0;
+        let outcomes = [false, false, true]; // Err, Err, Ok
+        loop {
+            visited.push(idx);
+            if outcomes[idx] {
+                break;
+            }
+            match next_tier(idx, len) {
+                Some(n) => idx = n,
+                None => break,
+            }
+        }
+        assert_eq!(visited, vec![0, 1, 2], "walked {visited:?}");
+        assert_eq!(idx, 2, "final tier index is the answering tier");
+
+        // A failing chain with no Ok exhausts exactly once: 0 -> 1 -> 2 -> None.
+        let mut idx = 0;
+        let mut steps = 0;
+        let mut visited = vec![0];
+        while let Some(n) = next_tier(idx, len) {
+            idx = n;
+            visited.push(idx);
+            steps += 1;
+            if steps > len {
+                panic!("unbounded walk");
+            }
+        }
+        assert_eq!(visited, vec![0, 1, 2], "exhausted {visited:?}");
+        assert!(next_tier(2, len).is_none());
+        assert!(next_tier(0, 1).is_none(), "single-tier chain has no escalation");
     }
 
     fn ev_with(actor: &str, kind: &str, body: serde_json::Value, seq: u64) -> ledger::Event {
