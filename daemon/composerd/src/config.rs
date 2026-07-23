@@ -10,6 +10,10 @@ pub struct Config {
     pub roles: BTreeMap<String, RoleCfg>,
     #[serde(default)]
     pub policy: PolicyCfg,
+    #[serde(default)]
+    pub pricing: BTreeMap<String, PriceCfg>,
+    #[serde(default)]
+    pub budgets: BudgetCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -53,6 +57,28 @@ impl Default for PolicyCfg {
 
 fn default_approval_timeout() -> u64 {
     300
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PriceCfg {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct BudgetCfg {
+    #[serde(default)]
+    pub session_usd: Option<f64>,
+}
+
+/// Cost of one model call, or None when the model has no price entry —
+/// unknown pricing is surfaced as unmetered, never silently $0.
+pub fn cost_usd(cfg: &Config, model: &str, prompt: u64, completion: u64) -> Option<f64> {
+    let p = cfg.pricing.get(model)?;
+    Some(
+        (prompt as f64 / 1_000_000.0) * p.input_per_mtok
+            + (completion as f64 / 1_000_000.0) * p.output_per_mtok,
+    )
 }
 
 const DEFAULT_CONFIG: &str = r#"[server]
@@ -181,5 +207,45 @@ model = "stub-model"
         let secs = secrets(&cfg);
         assert!(secs.contains(&"sk-test-SECRET-999".to_string()));
         std::env::remove_var("FC_TEST_KEY_T3");
+    }
+
+    #[test]
+    fn pricing_and_budgets_parse_and_cost_computes() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.stub]
+base_url = "http://127.0.0.1:0/v1"
+
+[roles.orchestrator]
+provider = "stub"
+model = "stub-m2"
+
+[pricing."stub-m2"]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+
+[budgets]
+session_usd = 5.0
+"#,
+        )
+        .unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert_eq!(cfg.budgets.session_usd, Some(5.0));
+        // 1M prompt @ $1 + 0.5M completion @ $2 = $2.00
+        let c = cost_usd(&cfg, "stub-m2", 1_000_000, 500_000).unwrap();
+        assert!((c - 2.0).abs() < 1e-9, "{c}");
+        assert!(cost_usd(&cfg, "unknown-model", 1, 1).is_none());
+    }
+
+    #[test]
+    fn pricing_and_budgets_default_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert!(cfg.pricing.is_empty());
+        assert!(cfg.budgets.session_usd.is_none());
     }
 }
