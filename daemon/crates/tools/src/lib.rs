@@ -3,6 +3,7 @@
 pub mod fs_tools;
 pub mod shadow;
 pub mod terminal;
+pub mod worktree;
 
 pub use shadow::Shadow;
 
