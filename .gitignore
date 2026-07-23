@@ -1,0 +1,16 @@
+# Rust
+daemon/target/
+
+# Node
+extension/node_modules/
+extension/dist/
+extension/*.vsix
+
+# Secrets — never committed
+.env
+*.key
+auth.token
+
+# Local scratch
+tmp/
+*.log

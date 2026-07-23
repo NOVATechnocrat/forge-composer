@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "composerd",
+    "crates/ledger",
+    "crates/gateway",
+    "crates/policy",
+    "crates/tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/NOVATechnocrat/forge-composer"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+rand = "0.9"
+tempfile = "3"

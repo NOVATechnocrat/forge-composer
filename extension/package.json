@@ -1,0 +1,55 @@
+{
+  "name": "forge-composer",
+  "displayName": "Forge Composer",
+  "description": "First-party forgeloop-native agent composer: orchestrate, observe, and steer multi-agent coding sessions.",
+  "version": "0.1.0",
+  "publisher": "novatechnocrat",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "forgeComposer.open",
+        "title": "Forge Composer: Open"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "forgeComposer",
+          "title": "Forge Composer",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "forgeComposer": [
+        {
+          "type": "webview",
+          "id": "forgeComposer.chat",
+          "name": "Composer"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "ovsx pack || vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.100.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}
