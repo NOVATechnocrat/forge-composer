@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod forgeloop_bridge;
 pub mod orchestrator;
 pub mod serve;
 pub mod state;
