@@ -39,34 +39,57 @@ pub fn session_shadow(
 }
 
 pub async fn run_turn(state: Arc<AppState>, session: String) {
-    if let Err(e) = run_turn_inner(&state, &session).await {
-        let _ = state.append_event(
-            &session,
-            "system",
-            "error",
-            "trusted",
-            serde_json::json!({"error": format!("orchestrator: {e}")}),
-        );
-    }
+    let ctl = state.control_for(&session);
+    let st = state.clone();
+    let sess = session.clone();
+    let task = tokio::spawn(async move {
+        if let Err(e) = run_turn_inner(&st, &sess).await {
+            let _ = st.append_event(
+                &sess,
+                "system",
+                "error",
+                "trusted",
+                serde_json::json!({"error": format!("agent: {e}")}),
+            );
+        }
+    });
+    *ctl.abort.lock().unwrap() = Some(task.abort_handle());
+    let _ = task.await;
+    ctl.abort.lock().unwrap().take();
 }
 
 async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<()> {
     let events = state.store.read(session, 0)?;
 
-    let workspace = crate::state::load_meta(&state.state_dir, session)?
-        .map(|m| m.workspace)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let jail = tools::Jail::new(&workspace)?;
+    let meta = crate::state::load_meta(&state.state_dir, session)?
+        .unwrap_or_else(|| {
+            crate::state::SessionMeta::orchestrator(
+                std::env::current_dir().unwrap_or_default(),
+            )
+        });
+    let agent_actor = if meta.kind == "subagent" {
+        format!("sub:{session}")
+    } else {
+        "orchestrator".to_string()
+    };
+    let role = if state.cfg.roles.contains_key(&meta.role) {
+        meta.role.clone()
+    } else {
+        "orchestrator".to_string()
+    };
+    let cfg = crate::config::resolve_role(&state.cfg, &role)?;
+    let model_name = cfg.model.clone();
+    let jail = tools::Jail::new(meta.jail_root())?;
     let session_dir = state.store.dir(session);
-    let shadow = tools::Shadow::init(&session_dir, &workspace)?;
+    let shadow = tools::Shadow::init(&session_dir, meta.jail_root())?;
     let policy = policy::Policy::new(state.cfg.policy.rules.clone());
+    let ctl = state.control_for(session);
 
     let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
     for ev in events.iter() {
-        rebuild_one(&mut messages, ev, &jail);
+        rebuild_one(&mut messages, ev, &jail, &agent_actor);
     }
 
-    let cfg = crate::config::resolve_role(&state.cfg, "orchestrator")?;
     let scrub_names = crate::config::api_key_env_names(&state.cfg);
     let tools_json = tool_schemas();
 
@@ -79,8 +102,62 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
         .find(|e| e.kind == "message" && e.actor == "human")
         .map(|e| e.seq)
         .unwrap_or(0);
+    let mut last_seen_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
 
     for _ in 0..MAX_ITERATIONS {
+        // Fold events appended since we built the prompt (steer / inject / takeover).
+        let fresh = state.store.read(session, last_seen_seq)?;
+        for ev in &fresh {
+            match ev.kind.as_str() {
+                "steer" => messages.push(ChatMessage::text(
+                    "user",
+                    &format!(
+                        "STEER (course correction from {}): {}",
+                        ev.actor,
+                        ev.body.get("text").and_then(|t| t.as_str()).unwrap_or("")
+                    ),
+                )),
+                "context_inject" => messages.push(ChatMessage::text(
+                    "user",
+                    &format!(
+                        "CONTEXT: {}",
+                        ev.body.get("text").and_then(|t| t.as_str()).unwrap_or("")
+                    ),
+                )),
+                "message" if ev.actor == "human" => messages.push(ChatMessage::text(
+                    "user",
+                    ev.body.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                )),
+                _ => {}
+            }
+            last_seen_seq = ev.seq;
+        }
+
+        // Soft-stop at the tool boundary.
+        if ctl.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            emit_usage(state, session, &agent_actor, &state.cfg, &model_name,
+                       total_prompt, total_completion);
+            return Ok(());
+        }
+
+        // Hard budget: pause-and-ask before spending more.
+        if let Some(limit) = state.cfg.budgets.session_usd {
+            let ledger_spend = session_spend(&state.store.read(session, 0)?);
+            let turn_spend = crate::config::cost_usd(
+                &state.cfg, &model_name, total_prompt, total_completion).unwrap_or(0.0);
+            let spent = ledger_spend + turn_spend;
+            if spent >= limit {
+                let _ = state.append_event(
+                    session, "system", "budget", "trusted",
+                    serde_json::json!({"limit_usd": limit, "spent_usd": spent, "action": "paused"}),
+                );
+                ctl.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+                emit_usage(state, session, &agent_actor, &state.cfg, &model_name,
+                           total_prompt, total_completion);
+                return Ok(());
+            }
+        }
+
         let state_for_delta = state.clone();
         let session_for_delta = session.to_string();
         let result = match gateway::chat(&cfg, &messages, Some(&tools_json), |d| {
@@ -107,21 +184,13 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
         if result.tool_calls.is_empty() {
             let _ = state.append_event(
                 session,
-                "orchestrator",
+                &agent_actor,
                 "message",
                 "trusted",
                 serde_json::json!({"text": result.content}),
             );
-            let _ = state.append_event(
-                session,
-                "orchestrator",
-                "usage",
-                "trusted",
-                serde_json::json!({
-                    "prompt_tokens": total_prompt,
-                    "completion_tokens": total_completion,
-                }),
-            );
+            emit_usage(state, session, &agent_actor, &state.cfg, &model_name,
+                       total_prompt, total_completion);
             return Ok(());
         }
 
@@ -133,7 +202,7 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
                 serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
             let _ = state.append_event(
                 session,
-                "orchestrator",
+                &agent_actor,
                 "tool_call",
                 "trusted",
                 serde_json::json!({"id": call.id, "name": call.name, "arguments": args}),
@@ -349,13 +418,41 @@ async fn run_tool(
     }
 }
 
-fn rebuild_one(messages: &mut Vec<ChatMessage>, ev: &ledger::Event, jail: &tools::Jail) {
+fn rebuild_one(
+    messages: &mut Vec<ChatMessage>,
+    ev: &ledger::Event,
+    jail: &tools::Jail,
+    agent_actor: &str,
+) {
     match ev.kind.as_str() {
+        "steer" => {
+            let text = ev.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            messages.push(ChatMessage::text(
+                "user",
+                &format!("STEER (course correction from {}): {}", ev.actor, text),
+            ));
+        }
+        "context_inject" => {
+            let text = ev.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            messages.push(ChatMessage::text("user", &format!("CONTEXT: {}", text)));
+        }
         "message" => {
-            let role = match ev.actor.as_str() {
-                "human" => "user",
-                "orchestrator" => "assistant",
-                _ => return,
+            let role = if ev.actor == agent_actor {
+                "assistant"
+            } else if ev.actor == "human" {
+                "user"
+            } else if ev.actor.starts_with("sub:") {
+                let text = ev.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                messages.push(ChatMessage::text(
+                    "user",
+                    &format!("Report from subagent {}:\n{}", &ev.actor[4..], frame(text)),
+                ));
+                return;
+            } else if ev.actor == "orchestrator" {
+                // On a subagent session the orchestrator is the brief/steer channel.
+                "user"
+            } else {
+                return;
             };
             let mut text = ev
                 .body
@@ -427,4 +524,61 @@ fn tool_schemas() -> serde_json::Value {
         {"type":"function","function":{"name":"edit_file","description":"Edit a file under the workspace jail; old_string empty = full write","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}}},
         {"type":"function","function":{"name":"terminal","description":"Run a shell command under the workspace jail","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}
     ])
+}
+
+fn session_spend(events: &[ledger::Event]) -> f64 {
+    events
+        .iter()
+        .filter(|e| e.kind == "usage")
+        .filter_map(|e| e.body.get("cost_usd").and_then(|c| c.as_f64()))
+        .sum()
+}
+
+fn emit_usage(
+    state: &Arc<AppState>,
+    session: &str,
+    actor: &str,
+    cfg: &crate::config::Config,
+    model: &str,
+    prompt: u64,
+    completion: u64,
+) {
+    let mut body = serde_json::json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+    });
+    if let Some(c) = crate::config::cost_usd(cfg, model, prompt, completion) {
+        body["cost_usd"] = serde_json::json!(c);
+    }
+    let _ = state.append_event(session, actor, "usage", "trusted", body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(kind: &str, body: serde_json::Value) -> ledger::Event {
+        ledger::Event {
+            v: ledger::SCHEMA.into(),
+            seq: 0,
+            ts: "t".into(),
+            session: "s".into(),
+            actor: "system".into(),
+            kind: kind.into(),
+            provenance: "trusted".into(),
+            body,
+        }
+    }
+
+    #[test]
+    fn session_spend_sums_cost_usd_events() {
+        let evs = vec![
+            ev("usage", serde_json::json!({"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5})),
+            ev("message", serde_json::json!({})),
+            ev("usage", serde_json::json!({"prompt_tokens":1,"completion_tokens":1})),
+            ev("usage", serde_json::json!({"cost_usd":0.25})),
+        ];
+        let total = session_spend(&evs);
+        assert!((total - 0.75).abs() < 1e-9, "{total}");
+    }
 }
