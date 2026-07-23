@@ -1,5 +1,10 @@
+import * as os from "os";
 import * as vscode from "vscode";
 import { DaemonClient, discover } from "./daemon";
+
+type FileAtRegistrar = (
+  fn: (session: string, hash: string, path: string) => Promise<string>
+) => void;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -8,7 +13,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private disposeStream?: () => void;
   private pendingDelta = "";
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly registerFileAt?: FileAtRegistrar
+  ) {}
 
   resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -33,17 +41,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((msg: {
       type?: string;
       text?: string;
+      attachments?: { path: string }[];
       requestId?: string;
       approved?: boolean;
+      path?: string;
+      line?: number;
+      session?: string;
+      hash?: string;
     }) => {
-      if (msg.type === "send" && typeof msg.text === "string") {
-        void this.handleSend(msg.text);
-      } else if (
-        msg.type === "approve" &&
-        typeof msg.requestId === "string" &&
-        typeof msg.approved === "boolean"
-      ) {
-        void this.handleApprove(msg.requestId, msg.approved);
+      switch (msg.type) {
+        case "send":
+          if (typeof msg.text === "string") {
+            void this.handleSend(msg.text, msg.attachments);
+          }
+          break;
+        case "approve":
+          if (
+            typeof msg.requestId === "string" &&
+            typeof msg.approved === "boolean"
+          ) {
+            void this.handleApprove(msg.requestId, msg.approved);
+          }
+          break;
+        case "openFile":
+          if (typeof msg.path === "string") {
+            void this.handleOpenFile(msg.path, msg.line);
+          }
+          break;
+        case "openDiff":
+          if (
+            typeof msg.session === "string" &&
+            typeof msg.hash === "string" &&
+            typeof msg.path === "string"
+          ) {
+            void this.handleOpenDiff(msg.session, msg.hash, msg.path);
+          }
+          break;
+        case "pickFile":
+          void this.handlePickFile(webviewView.webview);
+          break;
       }
     });
 
@@ -77,6 +113,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? sessions[0]!
           : await this.client.createSession(workspaceFolder);
 
+      this.registerFileAt?.((session, hash, path) =>
+        this.client!.fileAt(session, hash, path)
+      );
+
       const events = await this.client.events(this.session, 0);
       webview.postMessage({ type: "init", session: this.session, events });
 
@@ -94,7 +134,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleSend(text: string): Promise<void> {
+  private async handleSend(
+    text: string,
+    attachments?: { path: string }[]
+  ): Promise<void> {
     if (!this.client || !this.session || !this.view) {
       return;
     }
@@ -105,10 +148,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.pendingDelta = "";
-    this.view.webview.postMessage({ type: "userMessage", text: trimmed });
+    this.view.webview.postMessage({
+      type: "userMessage",
+      text: trimmed,
+      attachments,
+    });
 
     try {
-      await this.client.sendMessage(this.session, trimmed);
+      await this.client.sendMessage(this.session, trimmed, attachments);
     } catch (err) {
       this.view.webview.postMessage({
         type: "error",
@@ -132,6 +179,85 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         type: "error",
         text: err instanceof Error ? err.message : "approve failed",
       });
+    }
+  }
+
+  private async handleOpenFile(path: string, line?: number): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      return;
+    }
+
+    let filePath = path;
+    if (path.startsWith("~")) {
+      filePath = path.replace(/^~/, os.homedir());
+    } else if (!path.startsWith("/")) {
+      filePath = vscode.Uri.joinPath(folder.uri, path).fsPath;
+    }
+
+    const uri = vscode.Uri.file(filePath);
+    try {
+      await vscode.workspace.fs.stat(uri);
+    } catch {
+      return;
+    }
+
+    const doc = await vscode.window.showTextDocument(uri);
+    if (line !== undefined && line > 0) {
+      const pos = new vscode.Position(line - 1, 0);
+      doc.selection = new vscode.Selection(pos, pos);
+      doc.revealRange(new vscode.Range(pos, pos));
+    }
+  }
+
+  private async handleOpenDiff(
+    session: string,
+    hash: string,
+    relPath: string
+  ): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      return;
+    }
+
+    const encodedPath = relPath
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
+    const shadowUri = vscode.Uri.parse(
+      `forge-shadow:/${session}/${hash}/${encodedPath}`
+    );
+    const fileUri = vscode.Uri.joinPath(folder.uri, relPath);
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      shadowUri,
+      fileUri,
+      `${relPath} (checkpoint ↔ now)`
+    );
+  }
+
+  private async handlePickFile(webview: vscode.Webview): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      return;
+    }
+
+    const files = await vscode.workspace.findFiles(
+      "**/*",
+      "**/{node_modules,target,.git}/**",
+      500
+    );
+    const items = files.map((uri) => {
+      const rel = vscode.workspace.asRelativePath(uri);
+      return { label: rel, path: rel };
+    });
+    items.sort((a, b) => a.label.localeCompare(b.label));
+
+    const picked = await vscode.window.showQuickPick(items, {
+      placeHolder: "Attach file with @",
+    });
+    if (picked) {
+      webview.postMessage({ type: "filePicked", path: picked.path });
     }
   }
 
@@ -248,6 +374,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     background: var(--vscode-editor-inactiveSelectionBackground);
   }
   .msg.pending { opacity: 0.75; }
+  .msg a.file-link {
+    color: var(--vscode-textLink-foreground);
+    text-decoration: underline;
+    cursor: pointer;
+  }
   .event-card {
     align-self: stretch;
     padding: 0.5rem 0.75rem;
@@ -267,7 +398,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     border-color: var(--vscode-inputValidation-errorBorder);
     color: var(--vscode-errorForeground);
   }
-  .event-card.tool-result pre {
+  .event-card.tool-result .output {
     margin: 0.5rem 0 0;
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -275,6 +406,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     font-size: 0.85em;
     max-height: 12rem;
     overflow-y: auto;
+  }
+  .event-card.tool-result .output a.file-link {
+    color: var(--vscode-textLink-foreground);
+  }
+  .event-card.tool-result .diff-row { margin-top: 0.5rem; }
+  .event-card.tool-result .btn-diff {
+    padding: 0.2rem 0.6rem;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85em;
   }
   .event-card.approval .summary { margin-bottom: 0.5rem; }
   .event-card.approval .actions { display: flex; gap: 0.5rem; }
@@ -304,11 +449,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     font-size: 0.8em;
     padding: 0.15rem 0.5rem;
   }
+  #attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    padding: 0.35rem 0.5rem 0;
+    min-height: 0;
+  }
+  .attach-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-size: 0.8em;
+    cursor: pointer;
+  }
+  .attach-chip .remove { opacity: 0.75; }
   #input-area {
     display: flex;
     gap: 0.5rem;
     padding: 0.5rem;
     border-top: 1px solid var(--vscode-panel-border);
+    align-items: flex-end;
+  }
+  #attach {
+    padding: 0.5rem 0.65rem;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 600;
   }
   #input {
     flex: 1;
@@ -332,18 +507,84 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
+  <div id="attachments"></div>
   <div id="messages"></div>
   <div id="input-area">
+    <button id="attach" title="Attach file">@</button>
     <textarea id="input" rows="2" placeholder="Message Forge Composer…"></textarea>
     <button id="send">Send</button>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const messagesEl = document.getElementById("messages");
+    const attachmentsEl = document.getElementById("attachments");
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("send");
+    const attachBtn = document.getElementById("attach");
     let pendingEl = null;
     let sessionId = "";
+    let attachments = [];
+    const toolCallArgs = {};
+    const FILE_LINK_RE = /(~?[\\w./+-]*\\/)?[\\w.+-]+\\.[A-Za-z0-9]{1,8}(:\\d+)?/g;
+
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function linkify(text) {
+      const escaped = escapeHtml(text);
+      return escaped.replace(FILE_LINK_RE, (match) => {
+        let filePath = match;
+        let line;
+        const lineMatch = match.match(/:(\\d+)$/);
+        if (lineMatch) {
+          line = parseInt(lineMatch[1], 10);
+          filePath = match.slice(0, -lineMatch[0].length);
+        }
+        const lineAttr = line ? ' data-line="' + line + '"' : "";
+        return (
+          '<a href="#" class="file-link" data-path="' +
+          escapeHtml(filePath) +
+          '"' +
+          lineAttr +
+          ">" +
+          escapeHtml(match) +
+          "</a>"
+        );
+      });
+    }
+
+    function bindFileLinks(container) {
+      container.querySelectorAll("a.file-link").forEach((a) => {
+        a.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          const path = a.getAttribute("data-path") || "";
+          const lineStr = a.getAttribute("data-line");
+          const line = lineStr ? parseInt(lineStr, 10) : undefined;
+          vscode.postMessage({ type: "openFile", path, line });
+        });
+      });
+    }
+
+    function renderAttachments() {
+      attachmentsEl.innerHTML = "";
+      for (const att of attachments) {
+        const chip = document.createElement("span");
+        chip.className = "attach-chip";
+        chip.title = "Remove attachment";
+        chip.innerHTML =
+          escapeHtml(att.path) + ' <span class="remove">×</span>';
+        chip.addEventListener("click", () => {
+          attachments = attachments.filter((a) => a.path !== att.path);
+          renderAttachments();
+        });
+        attachmentsEl.appendChild(chip);
+      }
+    }
 
     function toolCallSummary(body) {
       const name = body.name || "tool";
@@ -381,9 +622,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (kind === "tool_call") {
+        if (body.id) {
+          toolCallArgs[body.id] = body.arguments;
+        }
         const el = document.createElement("div");
         el.className = "event-card tool-call";
-        el.textContent = toolCallSummary(body);
+        el.innerHTML = linkify(toolCallSummary(body));
+        bindFileLinks(el);
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
@@ -397,10 +642,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const summary = document.createElement("summary");
         summary.textContent = toolResultSummary(body);
         details.appendChild(summary);
-        const pre = document.createElement("pre");
-        pre.textContent = body.output || "";
-        details.appendChild(pre);
+        const output = document.createElement("div");
+        output.className = "output";
+        output.innerHTML = linkify(body.output || "");
+        bindFileLinks(output);
+        details.appendChild(output);
         el.appendChild(details);
+
+        if (body.name === "edit_file" && body.checkpoint) {
+          const args = toolCallArgs[body.id];
+          const editPath =
+            args && typeof args === "object" && args.path
+              ? String(args.path)
+              : null;
+          if (editPath) {
+            const diffRow = document.createElement("div");
+            diffRow.className = "diff-row";
+            const diffBtn = document.createElement("button");
+            diffBtn.className = "btn-diff";
+            diffBtn.textContent = "Diff";
+            diffBtn.addEventListener("click", () => {
+              vscode.postMessage({
+                type: "openDiff",
+                session: sessionId,
+                hash: body.checkpoint,
+                path: editPath,
+              });
+            });
+            diffRow.appendChild(diffBtn);
+            el.appendChild(diffRow);
+          }
+        }
+
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
@@ -412,7 +685,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         el.dataset.requestId = body.id || "";
         const summaryDiv = document.createElement("div");
         summaryDiv.className = "summary";
-        summaryDiv.textContent = "Approval required: " + (body.summary || body.tool || "");
+        summaryDiv.textContent =
+          "Approval required: " + (body.summary || body.tool || "");
         el.appendChild(summaryDiv);
         const actions = document.createElement("div");
         actions.className = "actions";
@@ -420,7 +694,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         approveBtn.className = "btn-approve";
         approveBtn.textContent = "Approve";
         approveBtn.addEventListener("click", () => {
-          vscode.postMessage({ type: "approve", requestId: body.id, approved: true });
+          vscode.postMessage({
+            type: "approve",
+            requestId: body.id,
+            approved: true,
+          });
           approveBtn.disabled = true;
           denyBtn.disabled = true;
         });
@@ -428,7 +706,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         denyBtn.className = "btn-deny";
         denyBtn.textContent = "Deny";
         denyBtn.addEventListener("click", () => {
-          vscode.postMessage({ type: "approve", requestId: body.id, approved: false });
+          vscode.postMessage({
+            type: "approve",
+            requestId: body.id,
+            approved: false,
+          });
           approveBtn.disabled = true;
           denyBtn.disabled = true;
         });
@@ -442,12 +724,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       if (kind === "approval_decision") {
         const requestId = body.id || "";
-        const card = messagesEl.querySelector('[data-request-id="' + requestId + '"]');
+        const card = messagesEl.querySelector(
+          '[data-request-id="' + requestId + '"]'
+        );
         if (card) {
           const actions = card.querySelector(".actions");
           if (actions) actions.remove();
           const decision = document.createElement("div");
-          decision.className = "decision " + (body.approved ? "approved" : "denied");
+          decision.className =
+            "decision " + (body.approved ? "approved" : "denied");
           decision.textContent = body.approved ? "✓ approved" : "✗ denied";
           card.appendChild(decision);
         } else {
@@ -475,7 +760,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     function addMessage(role, text, pending) {
       const el = document.createElement("div");
       el.className = "msg " + role + (pending ? " pending" : "");
-      el.textContent = text;
+      el.innerHTML = linkify(text);
+      bindFileLinks(el);
       messagesEl.appendChild(el);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return el;
@@ -492,7 +778,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!pendingEl) {
         pendingEl = addMessage("assistant", text, true);
       } else {
-        pendingEl.textContent = text;
+        pendingEl.innerHTML = linkify(text);
+        bindFileLinks(pendingEl);
       }
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
@@ -510,6 +797,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "userMessage":
           clearPending();
           addMessage("user", msg.text, false);
+          break;
+        case "filePicked":
+          if (typeof msg.path === "string") {
+            if (!attachments.some((a) => a.path === msg.path)) {
+              attachments.push({ path: msg.path });
+              renderAttachments();
+            }
+          }
           break;
         case "event":
           renderEvent(msg.event);
@@ -532,10 +827,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const text = inputEl.value.trim();
       if (!text) return;
       inputEl.value = "";
-      vscode.postMessage({ type: "send", text });
+      const payload = { type: "send", text };
+      if (attachments.length > 0) {
+        payload.attachments = attachments.slice();
+      }
+      vscode.postMessage(payload);
+      attachments = [];
+      renderAttachments();
     }
 
     sendBtn.addEventListener("click", doSend);
+    attachBtn.addEventListener("click", () => {
+      vscode.postMessage({ type: "pickFile" });
+    });
     inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
