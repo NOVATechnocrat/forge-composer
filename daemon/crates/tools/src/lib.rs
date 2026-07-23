@@ -1,6 +1,8 @@
 //! tools — worktree-jailed executors + shadow-git checkpoints.
 
 pub mod fs_tools;
+pub mod shadow;
+pub mod terminal;
 
 use std::path::{Path, PathBuf};
 
