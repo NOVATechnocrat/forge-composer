@@ -24,10 +24,7 @@ pub async fn run_turn(state: Arc<AppState>, session: String) {
         }
     };
 
-    let mut messages = vec![gateway::ChatMessage {
-        role: "system".into(),
-        content: SYSTEM_PROMPT.to_string(),
-    }];
+    let mut messages = vec![gateway::ChatMessage::text("system", SYSTEM_PROMPT)];
     for ev in events.iter() {
         if ev.kind != "message" {
             continue;
@@ -43,10 +40,7 @@ pub async fn run_turn(state: Arc<AppState>, session: String) {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
-        messages.push(gateway::ChatMessage {
-            role: role.into(),
-            content: text,
-        });
+        messages.push(gateway::ChatMessage::text(role, &text));
     }
 
     let cfg = match crate::config::resolve_role(&state.cfg, "orchestrator") {
@@ -65,7 +59,7 @@ pub async fn run_turn(state: Arc<AppState>, session: String) {
 
     let state_for_delta = state.clone();
     let session_for_delta = session.clone();
-    let result = gateway::chat_stream(&cfg, &messages, |d| {
+    let result = gateway::chat_stream(&cfg, &messages, None, |d| {
         state_for_delta.broadcast(&session_for_delta, crate::api::Frame::Delta(d.to_string()));
     })
     .await;

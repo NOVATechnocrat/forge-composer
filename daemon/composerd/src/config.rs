@@ -77,6 +77,7 @@ pub fn resolve_role(cfg: &Config, role: &str) -> anyhow::Result<gateway::Provide
         base_url: provider.base_url.clone(),
         model: role_cfg.model.clone(),
         api_key,
+        kind: gateway::ProviderKind::OpenAI,
     })
 }
 
