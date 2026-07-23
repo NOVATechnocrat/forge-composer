@@ -35,6 +35,7 @@ pub struct AppState {
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     pub controls:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<SessionControl>>>,
+    pub budget_overrides: std::sync::Mutex<std::collections::HashMap<String, f64>>,
 }
 
 /// Per-session control plane: a pause flag the agent loop polls at every tool
@@ -141,6 +142,8 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/restore", post(restore))
         .route("/sessions/{id}/file_at", get(file_at))
         .route("/sessions/{id}/diff", get(diff))
+        .route("/sessions/{id}/adopt", post(adopt))
+        .route("/sessions/{id}/budget", post(budget))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -590,6 +593,196 @@ async fn diff(
         Ok(patch) => Ok(axum::Json(serde_json::json!({"patch": patch}))),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
     }
+}
+
+#[derive(Deserialize)]
+pub struct AdoptBody {
+    pub child: String,
+}
+
+/// Run `git -C <cwd> <args...>`; returns Err with stderr on non-zero exit.
+fn git_in(cwd: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("git {} failed: {}", args.join(" "), err.trim());
+    }
+    Ok(())
+}
+
+/// Run `git -C <cwd> <args...>`; returns stdout on success, Err with stderr.
+fn git_in_out(cwd: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("git {} failed: {}", args.join(" "), err.trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Human-only adoption: commit a child subagent's worktree work, merge its
+/// branch into the parent workspace, remove the worktree, delete the branch,
+/// and ledger an `adopt` event on the parent. No model turn is triggered.
+async fn adopt(
+    State(state): State<Arc<AppState>>,
+    Path(parent): Path<String>,
+    body: axum::Json<AdoptBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&parent) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let child = &body.child;
+    let child_meta = crate::state::load_meta(&state.state_dir, child)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "unknown child session".into()))?;
+    if child_meta.kind != "subagent" {
+        return Err((StatusCode::BAD_REQUEST, "not a subagent".into()));
+    }
+    if child_meta.parent.as_deref() != Some(parent.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, "child does not belong to this parent".into()));
+    }
+    let worktree = match child_meta.worktree.as_deref() {
+        Some(w) => w,
+        None => return Err((StatusCode::BAD_REQUEST, "child has no worktree".into())),
+    };
+    let parent_meta = crate::state::load_meta(&state.state_dir, &parent)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or_else(|| crate::state::SessionMeta::orchestrator(std::path::PathBuf::from(".")));
+    let parent_ws = parent_meta.workspace.clone();
+    let branch = format!("fc/{}", child.to_lowercase());
+
+    // 1. Commit the child's dirty worktree as composer.
+    let dirty = git_in_out(worktree, &["status", "--porcelain"]).unwrap_or_default();
+    if !dirty.trim().is_empty() {
+        git_in(worktree, &["add", "-A"]).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let msg = format!("adopt {child}: subagent work");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["-c", "user.name=composer", "-c", "user.email=composer@forge"])
+            .args(["commit", "-q", "-m", &msg])
+            .output()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("commit child work: {err}")));
+        }
+    }
+
+    // 2. Merge the child branch into the parent workspace (no-ff).
+    let title = child_meta.title.clone().unwrap_or_default();
+    let merge_msg = if title.is_empty() {
+        format!("adopt {child}")
+    } else {
+        format!("adopt {child} ({title})")
+    };
+    let merge_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&parent_ws)
+        .args(["merge", "--no-ff", "-m", &merge_msg, &branch])
+        .output()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !merge_out.status.success() {
+        // Conflict: abort, leave the worktree intact, return 409.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&parent_ws)
+            .args(["merge", "--abort"])
+            .output();
+        let err = String::from_utf8_lossy(&merge_out.stderr);
+        return Err((
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "merge conflict", "child": child, "detail": err.trim()}).to_string(),
+        ));
+    }
+    let merge_commit = git_in_out(&parent_ws, &["rev-parse", "HEAD"])
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .trim()
+        .to_string();
+
+    // 3. Remove the worktree + delete the branch.
+    if let Err(e) = tools::worktree::remove(&parent_ws, worktree) {
+        // Non-fatal: the merge succeeded; surface but keep going.
+        let _ = state.append_event(
+            &parent,
+            "system",
+            "error",
+            "trusted",
+            serde_json::json!({"error": format!("worktree remove: {e}")}),
+        );
+    }
+    let _ = git_in(&parent_ws, &["branch", "-d", &branch])
+        .or_else(|_| git_in(&parent_ws, &["branch", "-D", &branch]));
+
+    // 4. Ledger the adoption on the parent (human action, trusted).
+    let _ = state.append_event(
+        &parent,
+        "human",
+        "adopt",
+        "trusted",
+        serde_json::json!({
+            "child": child,
+            "branch": branch,
+            "merge_commit": merge_commit,
+        }),
+    );
+
+    Ok(axum::Json(serde_json::json!({"merge_commit": merge_commit})))
+}
+
+#[derive(Deserialize)]
+pub struct BudgetBody {
+    pub session_usd: f64,
+}
+
+/// Human-only budget raise: set a per-session override, ledger a `budget`
+/// event (action:"raised"), and un-pause the session (resuming pending input).
+async fn budget(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<BudgetBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let limit = body.session_usd;
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err((StatusCode::BAD_REQUEST, "session_usd must be a finite positive number".into()));
+    }
+    {
+        let mut map = state.budget_overrides.lock().unwrap();
+        map.insert(id.clone(), limit);
+    }
+    let _ = state.append_event(
+        &id,
+        "human",
+        "budget",
+        "trusted",
+        serde_json::json!({"action": "raised", "limit_usd": limit}),
+    );
+    // Un-pause (resume semantics, including pending input).
+    let ctl = state.control_for(&id);
+    ctl.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    if !state.is_running(&id) {
+        if let Ok(evs) = state.store.read(&id, 0) {
+            if crate::api::has_pending_input(&evs) {
+                let st = state.clone();
+                let idc = id.clone();
+                tokio::spawn(async move {
+                    crate::orchestrator::run_turn(st, idc).await;
+                });
+            }
+        }
+    }
+    Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
 #[cfg(test)]
