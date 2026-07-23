@@ -16,6 +16,26 @@ pub struct Config {
     pub budgets: BudgetCfg,
     #[serde(default)]
     pub forgeloop: ForgeloopCfg,
+    #[serde(default)]
+    pub context: ContextCfg,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ContextCfg {
+    #[serde(default = "default_max_fold_events")]
+    pub max_fold_events: usize,
+}
+
+impl Default for ContextCfg {
+    fn default() -> Self {
+        Self {
+            max_fold_events: default_max_fold_events(),
+        }
+    }
+}
+
+fn default_max_fold_events() -> usize {
+    400
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -316,8 +336,7 @@ dir = "/tmp/fl"
     }
 
     #[test]
-    fn escalation_to_unknown_role_errors() {
-        let d = tempfile::tempdir().unwrap();
+    fn escalation_to_unknown_role_errors() {        let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join("config.toml"),
             r#"[server]
@@ -335,5 +354,34 @@ escalation = ["ghost"]
         .unwrap();
         let cfg = load_or_init(d.path()).unwrap();
         assert!(resolve_chain(&cfg, "orchestrator").is_err());
+    }
+
+    #[test]
+    fn context_max_fold_events_parses_and_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.stub]
+base_url = "http://127.0.0.1:0/v1"
+
+[roles.orchestrator]
+provider = "stub"
+model = "stub-model"
+
+[context]
+max_fold_events = 5
+"#,
+        )
+        .unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert_eq!(cfg.context.max_fold_events, 5);
+
+        // Absent section yields the default of 400.
+        let d2 = tempfile::tempdir().unwrap();
+        let cfg2 = load_or_init(d2.path()).unwrap();
+        assert_eq!(cfg2.context.max_fold_events, 400);
     }
 }
