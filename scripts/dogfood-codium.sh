@@ -25,6 +25,32 @@ done
 mkdir -p "$STATE" "$USER_DIR" "$EXT_DIR" "$WS"
 [[ -f "$WS/hello.py" ]] || printf 'print("hello from forge-composer dogfood")\n' > "$WS/hello.py"
 
+# Cursor-parity edit flow for the environment humans actually dogfood in: edits
+# apply without an approval card. The safety net is the cockpit — every edit
+# takes a shadow checkpoint, so /diff shows what changed and /restore reverts
+# it. Written only when absent so we never clobber a hand-edited config.
+if [[ ! -f "$STATE/config.toml" ]]; then
+  cat > "$STATE/config.toml" <<'EOF'
+[server]
+port = 8642
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434/v1"
+
+[providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+[roles.orchestrator]
+provider = "ollama"
+model = "qwen2.5:14b-instruct"
+
+# Cursor-parity: auto-apply edits. Checkpoints + /diff + /restore are the net.
+[policy]
+auto_approve_edits = true
+EOF
+fi
+
 if [[ ! -f "$EXT/dist/extension.js" ]]; then
   (cd "$EXT" && npm run build)
 fi
