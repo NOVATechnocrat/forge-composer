@@ -48,6 +48,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       line?: number;
       session?: string;
       hash?: string;
+      action?: string;
     }) => {
       switch (msg.type) {
         case "send":
@@ -61,6 +62,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             typeof msg.approved === "boolean"
           ) {
             void this.handleApprove(msg.requestId, msg.approved);
+          }
+          break;
+        case "control":
+          if (typeof msg.action === "string") {
+            void this.handleControl(msg.action);
           }
           break;
         case "openFile":
@@ -150,14 +156,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingDelta = "";
     this.disposeStream?.();
 
-    const events = await this.client.events(this.session, 0);
-    wv.postMessage({ type: "init", session: this.session, events });
+    const [events, details] = await Promise.all([
+      this.client.events(this.session, 0),
+      this.client.sessionsDetail(),
+    ]);
+    const detail = details.find((d) => d.id === this.session);
+
+    wv.postMessage({ type: "reset" });
+    wv.postMessage({
+      type: "init",
+      session: this.session,
+      kind: detail?.kind ?? "orchestrator",
+      events,
+    });
 
     this.disposeStream = this.client.stream(
       this.session,
       (e) => this.onLedger(e),
       (t) => this.onDelta(t)
     );
+  }
+
+  private async handleControl(action: string): Promise<void> {
+    if (!this.client || !this.session || !this.view) {
+      return;
+    }
+
+    try {
+      switch (action) {
+        case "pause":
+          await this.client.pause(this.session);
+          break;
+        case "resume":
+          await this.client.resume(this.session);
+          break;
+        case "steer": {
+          const text = await vscode.window.showInputBox({
+            prompt: "Steer text",
+          });
+          if (!text) {
+            return;
+          }
+          await this.client.steer(this.session, text);
+          break;
+        }
+        case "interrupt":
+          await this.client.interrupt(this.session);
+          break;
+        default:
+          return;
+      }
+    } catch (err) {
+      this.view.webview.postMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "control failed",
+      });
+    }
   }
 
   private async handleSend(
@@ -311,7 +365,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       e.kind === "approval_request" ||
       e.kind === "approval_decision" ||
       e.kind === "usage" ||
-      (e.kind === "message" && e.actor === "human")
+      e.kind === "dispatch" ||
+      e.kind === "steer" ||
+      e.kind === "context_inject" ||
+      e.kind === "pause" ||
+      e.kind === "resume" ||
+      e.kind === "interrupt" ||
+      e.kind === "budget" ||
+      (e.kind === "message" && e.actor === "human") ||
+      (e.kind === "message" &&
+        typeof e.actor === "string" &&
+        e.actor.startsWith("sub:"))
     ) {
       this.view.webview.postMessage({ type: "event", event: e });
     }
@@ -479,6 +543,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     font-size: 0.8em;
     padding: 0.15rem 0.5rem;
   }
+  .event-card.budget {
+    border-color: var(--vscode-inputValidation-errorBorder);
+    color: var(--vscode-errorForeground);
+  }
+  .event-card.report {
+    border-left: 3px solid var(--vscode-textLink-foreground);
+  }
+  .event-card.report .report-label {
+    font-size: 0.8em;
+    opacity: 0.75;
+    margin-bottom: 0.25rem;
+  }
+  #control-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 0.5rem;
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    font-size: 0.85em;
+  }
+  #session-label {
+    font-family: var(--vscode-editor-font-family);
+    opacity: 0.85;
+  }
+  #kind-badge {
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-size: 0.8em;
+  }
+  #control-strip button {
+    padding: 0.2rem 0.55rem;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85em;
+  }
+  #control-strip button:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+  }
   #attachments {
     display: flex;
     flex-wrap: wrap;
@@ -537,6 +646,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
+  <div id="control-strip">
+    <span id="session-label"></span>
+    <span id="kind-badge"></span>
+    <button id="btn-pause" type="button">Pause ⏸</button>
+    <button id="btn-resume" type="button">Resume ▶</button>
+    <button id="btn-steer" type="button">Steer</button>
+    <button id="btn-stop" type="button">Stop ■</button>
+  </div>
   <div id="attachments"></div>
   <div id="messages"></div>
   <div id="input-area">
@@ -548,6 +665,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const messagesEl = document.getElementById("messages");
     const attachmentsEl = document.getElementById("attachments");
+    const sessionLabelEl = document.getElementById("session-label");
+    const kindBadgeEl = document.getElementById("kind-badge");
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("send");
     const attachBtn = document.getElementById("attach");
@@ -556,6 +675,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let attachments = [];
     const toolCallArgs = {};
     const FILE_LINK_RE = /(~?[\\w./+-]*\\/)?[\\w.+-]+\\.[A-Za-z0-9]{1,8}(:\\d+)?/g;
+
+    function updateSessionHeader(id, kind) {
+      sessionId = id || "";
+      if (sessionLabelEl) {
+        sessionLabelEl.textContent = id ? id.slice(-8) : "";
+      }
+      if (kindBadgeEl) {
+        kindBadgeEl.textContent = kind || "orchestrator";
+      }
+    }
 
     function escapeHtml(s) {
       return s
@@ -785,6 +914,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
       }
+
+      if (kind === "dispatch") {
+        const el = document.createElement("div");
+        el.className = "event-card";
+        const title = body.title || body.child || "?";
+        const role = body.role || "";
+        el.textContent = "⇄ dispatched " + title + " (" + role + ")";
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "steer") {
+        const el = document.createElement("div");
+        el.className = "event-card";
+        el.textContent =
+          "⤳ steer (" + (e.actor || "?") + "): " + (body.text || "");
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "context_inject") {
+        const el = document.createElement("div");
+        el.className = "event-card";
+        el.textContent = "+ context injected";
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "pause" || kind === "resume" || kind === "interrupt") {
+        const el = document.createElement("div");
+        el.className = "event-muted";
+        el.textContent = kind;
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "budget") {
+        const el = document.createElement("div");
+        el.className = "event-card budget";
+        const spent = body.spent_usd ?? "?";
+        const limit = body.limit_usd ?? "?";
+        el.textContent =
+          "budget exceeded: $" + spent + " ≥ $" + limit + " — paused";
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "message" && e.actor && e.actor.startsWith("sub:")) {
+        const el = document.createElement("div");
+        el.className = "event-card report";
+        const label = document.createElement("div");
+        label.className = "report-label";
+        label.textContent = "report from " + e.actor;
+        el.appendChild(label);
+        const bodyEl = document.createElement("div");
+        bodyEl.innerHTML = linkify(body.text || "");
+        bindFileLinks(bodyEl);
+        el.appendChild(bodyEl);
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
     }
 
     function addMessage(role, text, pending) {
@@ -817,9 +1013,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener("message", (event) => {
       const msg = event.data;
       switch (msg.type) {
+        case "reset":
+          messagesEl.innerHTML = "";
+          clearPending();
+          for (const key of Object.keys(toolCallArgs)) {
+            delete toolCallArgs[key];
+          }
+          break;
         case "init":
           messagesEl.innerHTML = "";
-          sessionId = msg.session || "";
+          updateSessionHeader(msg.session || "", msg.kind || "orchestrator");
           for (const e of msg.events || []) {
             renderEvent(e);
           }
@@ -869,6 +1072,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     sendBtn.addEventListener("click", doSend);
     attachBtn.addEventListener("click", () => {
       vscode.postMessage({ type: "pickFile" });
+    });
+    document.getElementById("btn-pause").addEventListener("click", () => {
+      vscode.postMessage({ type: "control", action: "pause" });
+    });
+    document.getElementById("btn-resume").addEventListener("click", () => {
+      vscode.postMessage({ type: "control", action: "resume" });
+    });
+    document.getElementById("btn-steer").addEventListener("click", () => {
+      vscode.postMessage({ type: "control", action: "steer" });
+    });
+    document.getElementById("btn-stop").addEventListener("click", () => {
+      vscode.postMessage({ type: "control", action: "interrupt" });
     });
     inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
