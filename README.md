@@ -35,11 +35,12 @@ Two components:
 
 ## Status
 
-M0 (Spine) + M1 (Hands) + M2 (Orchestra) + M3 (Physics) loop-gated. Dogfood
-via `bash scripts/dogfood-codium.sh` (isolated VSCodium profile — does not
-touch your Cursor session).
+M0 (Spine) + M1 (Hands) + M2 (Orchestra) + M3 (Physics) + M4 (Cockpit)
+loop-gated. Dogfood via `bash scripts/dogfood-codium.sh` (isolated VSCodium
+profile — does not touch your Cursor session).
 
-M4 (Ship — packaging, docs, first-run experience) is next.
+M5 (Ship — packaging, first-run, model selector + context indicator, live
+end-to-end demo) is next.
 
 ## License
 
