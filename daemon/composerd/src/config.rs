@@ -93,6 +93,10 @@ fn default_approval_timeout() -> u64 {
 pub struct PriceCfg {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
+    /// Optional context window (tokens) for the gauge denominator; absent
+    /// means "unknown" and the gauge falls back to a plain token count.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -383,5 +387,63 @@ max_fold_events = 5
         let d2 = tempfile::tempdir().unwrap();
         let cfg2 = load_or_init(d2.path()).unwrap();
         assert_eq!(cfg2.context.max_fold_events, 400);
+    }
+
+    #[test]
+    fn pricing_context_window_parses_present_and_absents_to_none() {
+        // Present: context_window is read off the pricing entry.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.stub]
+base_url = "http://127.0.0.1:0/v1"
+
+[roles.orchestrator]
+provider = "stub"
+model = "stub-m5"
+
+[pricing."stub-m5"]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+context_window = 1000
+"#,
+        )
+        .unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert_eq!(
+            cfg.pricing.get("stub-m5").and_then(|p| p.context_window),
+            Some(1000),
+            "context_window present should parse"
+        );
+
+        // Absent: context_window defaults to None (gauge falls back to plain count).
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d2.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.stub]
+base_url = "http://127.0.0.1:0/v1"
+
+[roles.orchestrator]
+provider = "stub"
+model = "stub-m5"
+
+[pricing."stub-m5"]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+"#,
+        )
+        .unwrap();
+        let cfg2 = load_or_init(d2.path()).unwrap();
+        assert_eq!(
+            cfg2.pricing.get("stub-m5").and_then(|p| p.context_window),
+            None,
+            "context_window absent should be None"
+        );
     }
 }

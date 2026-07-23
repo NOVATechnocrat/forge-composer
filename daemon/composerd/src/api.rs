@@ -127,11 +127,13 @@ pub fn has_pending_input(events: &[ledger::Event]) -> bool {
 
 pub async fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
+        .route("/roles", get(roles))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/detail", get(sessions_detail))
         .route("/sessions/{id}/events", get(events))
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/message", post(post_message))
+        .route("/sessions/{id}/role", post(set_role))
         .route("/sessions/{id}/approve", post(approve))
         .route("/sessions/{id}/pause", post(pause))
         .route("/sessions/{id}/resume", post(resume))
@@ -181,24 +183,95 @@ pub async fn auth_middleware(
 pub struct CreateSessionBody {
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 async fn create_session(
     State(state): State<Arc<AppState>>,
     body: Option<axum::Json<CreateSessionBody>>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let workspace = body
-        .and_then(|b| b.0.workspace)
+    let (workspace, role) = match body {
+        Some(b) => (b.0.workspace, b.0.role),
+        None => (None, None),
+    };
+    let workspace = workspace
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let role = role.filter(|s| !s.is_empty()).unwrap_or_else(|| "orchestrator".to_string());
+    if !state.cfg.roles.contains_key(&role) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown role: {role}"),
+        ));
+    }
     let id = state
         .store
         .create_session()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let meta = crate::state::SessionMeta::orchestrator(workspace);
+    let mut meta = crate::state::SessionMeta::orchestrator(workspace);
+    meta.role = role;
     let _ = crate::state::write_meta(&state.state_dir, &id, &meta);
     Ok(axum::Json(serde_json::json!({"id": id})))
+}
+
+/// `GET /roles` — every configured role as `{name, provider, model}`, sorted by
+/// name. `roles` is a BTreeMap so iteration is already name-sorted.
+async fn roles(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let mut out = Vec::with_capacity(state.cfg.roles.len());
+    for (name, rc) in &state.cfg.roles {
+        out.push(serde_json::json!({
+            "name": name,
+            "provider": rc.provider,
+            "model": rc.model,
+        }));
+    }
+    Ok(axum::Json(serde_json::json!({"roles": out})))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RoleBody {
+    pub role: String,
+}
+
+/// `POST /sessions/{id}/role` — switch a session's role mid-flight. The role
+/// must exist in config (400 otherwise); `meta.role` is updated AND persisted,
+/// and a `role_switch` event (actor:human, from/to) is ledgered BEFORE the next
+/// turn runs, so the switch is never invisible. `run_turn` reads `meta.role`
+/// fresh at turn start, so the next turn resolves the new role's chain.
+async fn set_role(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<RoleBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let new_role = body.role.clone();
+    if !state.cfg.roles.contains_key(&new_role) {
+        return Err((StatusCode::BAD_REQUEST, format!("unknown role: {new_role}")));
+    }
+    let mut meta = crate::state::load_meta(&state.state_dir, &id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or_else(|| {
+            crate::state::SessionMeta::orchestrator(std::env::current_dir().unwrap_or_default())
+        });
+    let old_role = meta.role.clone();
+    if old_role != new_role {
+        meta.role = new_role.clone();
+        let _ = crate::state::write_meta(&state.state_dir, &id, &meta);
+        let _ = state.append_event(
+            &id,
+            "human",
+            "role_switch",
+            "trusted",
+            serde_json::json!({"from": old_role, "to": new_role}),
+        );
+    }
+    Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
 async fn list_sessions(
