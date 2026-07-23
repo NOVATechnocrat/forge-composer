@@ -43,8 +43,22 @@
       {
         "command": "forgeComposer.interruptSession",
         "title": "Forge Composer: Interrupt Session (hard stop)"
+      },
+      {
+        "command": "forgeComposer.adoptWork",
+        "title": "Adopt work",
+        "icon": "$(git-merge)"
       }
     ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "forgeComposer.adoptWork",
+          "when": "view == forgeComposer.sessions && viewItem == subagentIdle",
+          "group": "inline"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {

@@ -8,7 +8,7 @@ export class SessionNode {
   ) {}
 }
 
-export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNode> {
+export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNode>, vscode.Disposable {
   private readonly _onDidChangeTreeData =
     new vscode.EventEmitter<SessionNode | undefined>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -16,12 +16,22 @@ export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNod
   private client?: DaemonClient;
   private sessions: SessionDetail[] = [];
   private pollTimer?: ReturnType<typeof setInterval>;
+  private readonly disposables: vscode.Disposable[] = [];
 
   constructor() {
     const info = discover();
     if (info) {
       this.client = new DaemonClient(info);
     }
+
+    this.disposables.push(
+      vscode.commands.registerCommand(
+        "forgeComposer.adoptWork",
+        (node: SessionNode) => {
+          void this.handleAdopt(node);
+        }
+      )
+    );
   }
 
   getClient(): DaemonClient | undefined {
@@ -37,6 +47,40 @@ export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNod
     if (this.pollTimer !== undefined) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
+    }
+    for (const d of this.disposables) {
+      d.dispose();
+    }
+  }
+
+  private async handleAdopt(node: SessionNode): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+
+    const child = node.detail;
+    if (child.kind !== "subagent" || !child.parent) {
+      return;
+    }
+
+    const branch = `fc/${child.id.toLowerCase()}`;
+    const confirmed = await vscode.window.showWarningMessage(
+      `Merge ${branch} into your branch and remove the worktree?`,
+      { modal: true },
+      "Adopt work"
+    );
+    if (confirmed !== "Adopt work") {
+      return;
+    }
+
+    try {
+      await this.client.adopt(child.parent, child.id);
+      await this.refresh();
+      void vscode.window.showInformationMessage("Work adopted.");
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "adopt failed"
+      );
     }
   }
 
@@ -79,6 +123,9 @@ export class SessionsBoardProvider implements vscode.TreeDataProvider<SessionNod
       title: "Open Session",
       arguments: [d.id],
     };
+    if (d.kind === "subagent" && d.status === "idle") {
+      item.contextValue = "subagentIdle";
+    }
     return item;
   }
 

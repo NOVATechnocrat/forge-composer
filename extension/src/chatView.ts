@@ -41,7 +41,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((msg: {
       type?: string;
       text?: string;
-      attachments?: { path: string }[];
+      attachments?: { name: string; content: string }[];
       requestId?: string;
       approved?: boolean;
       path?: string;
@@ -49,6 +49,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       session?: string;
       hash?: string;
       action?: string;
+      childId?: string;
+      limitUsd?: number;
     }) => {
       switch (msg.type) {
         case "send":
@@ -81,6 +83,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             typeof msg.path === "string"
           ) {
             void this.handleOpenDiff(msg.session, msg.hash, msg.path);
+          }
+          break;
+        case "viewCheckpointDiff":
+          if (typeof msg.hash === "string") {
+            void this.handleViewCheckpointDiff(msg.hash);
+          }
+          break;
+        case "revertCheckpoint":
+          if (typeof msg.hash === "string") {
+            void this.handleRevertCheckpoint(msg.hash);
+          }
+          break;
+        case "raiseBudget":
+          if (typeof msg.limitUsd === "number") {
+            void this.handleRaiseBudget(msg.limitUsd);
+          }
+          break;
+        case "adoptWork":
+          if (typeof msg.childId === "string") {
+            void this.handleAdoptWork(msg.childId);
           }
           break;
         case "pickFile":
@@ -216,7 +238,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async handleSend(
     text: string,
-    attachments?: { path: string }[]
+    attachments?: { name: string; content: string }[]
   ): Promise<void> {
     if (!this.client || !this.session || !this.view) {
       return;
@@ -322,6 +344,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const maxBytes = 256 * 1024;
     const files = await vscode.workspace.findFiles(
       "**/*",
       "**/{node_modules,target,.git}/**",
@@ -329,15 +352,137 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const items = files.map((uri) => {
       const rel = vscode.workspace.asRelativePath(uri);
-      return { label: rel, path: rel };
+      return { label: rel, uri, name: rel };
     });
     items.sort((a, b) => a.label.localeCompare(b.label));
 
     const picked = await vscode.window.showQuickPick(items, {
-      placeHolder: "Attach file with @",
+      placeHolder: "Attach file",
     });
-    if (picked) {
-      webview.postMessage({ type: "filePicked", path: picked.path });
+    if (!picked) {
+      return;
+    }
+
+    try {
+      const data = await vscode.workspace.fs.readFile(picked.uri);
+      if (data.byteLength > maxBytes) {
+        void vscode.window.showErrorMessage(
+          `File exceeds 256 KiB limit (${picked.name})`
+        );
+        return;
+      }
+      const content = Buffer.from(data).toString("utf8");
+      webview.postMessage({
+        type: "filePicked",
+        name: picked.name,
+        content,
+      });
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "failed to read file"
+      );
+    }
+  }
+
+  private async handleViewCheckpointDiff(hash: string): Promise<void> {
+    if (!this.client || !this.session) {
+      return;
+    }
+
+    try {
+      const { patch } = await this.client.diff(this.session, hash);
+      const shortHash = hash.slice(0, 7);
+      const uri = vscode.Uri.parse(
+        `untitled:checkpoint ${shortHash} → now`
+      );
+      const edit = new vscode.WorkspaceEdit();
+      edit.createFile(uri, { ignoreIfExists: true, overwrite: true });
+      edit.insert(uri, new vscode.Position(0, 0), patch);
+      await vscode.workspace.applyEdit(edit);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.languages.setTextDocumentLanguage(doc, "diff");
+      await vscode.window.showTextDocument(doc, { preview: false });
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "diff failed"
+      );
+    }
+  }
+
+  private async handleRevertCheckpoint(hash: string): Promise<void> {
+    if (!this.client || !this.session) {
+      return;
+    }
+
+    const shortHash = hash.slice(0, 7);
+    const confirmed = await vscode.window.showWarningMessage(
+      `Revert workspace to checkpoint ${shortHash}?`,
+      { modal: true },
+      "Revert"
+    );
+    if (confirmed !== "Revert") {
+      return;
+    }
+
+    try {
+      await this.client.restore(this.session, hash);
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "restore failed"
+      );
+    }
+  }
+
+  private async handleRaiseBudget(currentLimit: number): Promise<void> {
+    if (!this.client || !this.session) {
+      return;
+    }
+
+    const prefilled = (currentLimit * 2).toString();
+    const input = await vscode.window.showInputBox({
+      prompt: "New session budget (USD)",
+      value: prefilled,
+    });
+    if (!input) {
+      return;
+    }
+
+    const usd = parseFloat(input);
+    if (!Number.isFinite(usd) || usd <= 0) {
+      void vscode.window.showErrorMessage("Budget must be a positive number.");
+      return;
+    }
+
+    try {
+      await this.client.raiseBudget(this.session, usd);
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "budget raise failed"
+      );
+    }
+  }
+
+  private async handleAdoptWork(childId: string): Promise<void> {
+    if (!this.client || !this.session) {
+      return;
+    }
+
+    const branch = `fc/${childId.toLowerCase()}`;
+    const confirmed = await vscode.window.showWarningMessage(
+      `Merge ${branch} into your branch and remove the worktree?`,
+      { modal: true },
+      "Adopt work"
+    );
+    if (confirmed !== "Adopt work") {
+      return;
+    }
+
+    try {
+      await this.client.adopt(this.session, childId);
+    } catch (err) {
+      void vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "adopt failed"
+      );
     }
   }
 
@@ -372,6 +517,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       e.kind === "resume" ||
       e.kind === "interrupt" ||
       e.kind === "budget" ||
+      e.kind === "adopt" ||
       e.kind === "verdict" ||
       e.kind === "error" ||
       (e.kind === "message" && e.actor === "human") ||
@@ -457,9 +603,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     word-wrap: break-word;
     white-space: pre-wrap;
   }
-  .msg.user {
-    align-self: flex-end;
-    background: var(--vscode-input-background);
+  .msg.user .attach-chips {
+    margin-top: 0.35rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    font-size: 0.85em;
+    opacity: 0.9;
+  }
+  .msg.user .attach-chip-inline {
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
   }
   .msg.assistant {
     align-self: stretch;
@@ -544,6 +700,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     opacity: 0.65;
     font-size: 0.8em;
     padding: 0.15rem 0.5rem;
+  }
+  .event-card.budget .actions { margin-top: 0.5rem; }
+  .event-card.budget button,
+  .event-card.report .btn-adopt,
+  .event-card.checkpoint .btn-action {
+    padding: 0.2rem 0.6rem;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85em;
+    margin-right: 0.35rem;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: var(--vscode-input-background);
   }
   .event-card.budget {
     border-color: var(--vscode-inputValidation-errorBorder);
@@ -675,7 +849,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="attachments"></div>
   <div id="messages"></div>
   <div id="input-area">
-    <button id="attach" title="Attach file">@</button>
+    <button id="attach" title="Attach file">📎</button>
     <textarea id="input" rows="2" placeholder="Message Forge Composer…"></textarea>
     <button id="send">Send</button>
   </div>
@@ -754,9 +928,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         chip.className = "attach-chip";
         chip.title = "Remove attachment";
         chip.innerHTML =
-          escapeHtml(att.path) + ' <span class="remove">×</span>';
+          "📎 " + escapeHtml(att.name) + ' <span class="remove">×</span>';
         chip.addEventListener("click", () => {
-          attachments = attachments.filter((a) => a.path !== att.path);
+          attachments = attachments.filter((a) => a.name !== att.name);
           renderAttachments();
         });
         attachmentsEl.appendChild(chip);
@@ -794,7 +968,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const body = e.body || {};
 
       if (kind === "message" && e.actor === "human") {
-        addMessage("user", body.text || "", false);
+        addMessage("user", body.text || "", false, body.attachments);
         return;
       }
 
@@ -826,29 +1000,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         details.appendChild(output);
         el.appendChild(details);
 
-        if (body.name === "edit_file" && body.checkpoint) {
-          const args = toolCallArgs[body.id];
-          const editPath =
-            args && typeof args === "object" && args.path
-              ? String(args.path)
-              : null;
-          if (editPath) {
-            const diffRow = document.createElement("div");
-            diffRow.className = "diff-row";
-            const diffBtn = document.createElement("button");
-            diffBtn.className = "btn-diff";
-            diffBtn.textContent = "Diff";
-            diffBtn.addEventListener("click", () => {
-              vscode.postMessage({
-                type: "openDiff",
-                session: sessionId,
-                hash: body.checkpoint,
-                path: editPath,
-              });
+        if (body.checkpoint) {
+          const diffRow = document.createElement("div");
+          diffRow.className = "diff-row";
+          const viewBtn = document.createElement("button");
+          viewBtn.className = "btn-diff";
+          viewBtn.textContent = "View diff";
+          viewBtn.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "viewCheckpointDiff",
+              hash: body.checkpoint,
             });
-            diffRow.appendChild(diffBtn);
-            el.appendChild(diffRow);
-          }
+          });
+          diffRow.appendChild(viewBtn);
+          const revertBtn = document.createElement("button");
+          revertBtn.className = "btn-diff";
+          revertBtn.textContent = "Revert";
+          revertBtn.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "revertCheckpoint",
+              hash: body.checkpoint,
+            });
+          });
+          diffRow.appendChild(revertBtn);
+          el.appendChild(diffRow);
         }
 
         messagesEl.appendChild(el);
@@ -973,12 +1148,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (kind === "budget") {
+        if (body.action === "raised") {
+          const el = document.createElement("div");
+          el.className = "event-muted";
+          el.textContent =
+            "budget raised to $" + (body.limit_usd ?? "?");
+          messagesEl.appendChild(el);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          return;
+        }
         const el = document.createElement("div");
         el.className = "event-card budget";
         const spent = body.spent_usd ?? "?";
         const limit = body.limit_usd ?? "?";
         el.textContent =
           "budget exceeded: $" + spent + " ≥ $" + limit + " — paused";
+        if (body.action === "paused") {
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const raiseBtn = document.createElement("button");
+          raiseBtn.type = "button";
+          raiseBtn.textContent = "Raise budget…";
+          raiseBtn.addEventListener("click", () => {
+            const limitNum = typeof body.limit_usd === "number"
+              ? body.limit_usd
+              : parseFloat(String(body.limit_usd));
+            if (Number.isFinite(limitNum)) {
+              vscode.postMessage({ type: "raiseBudget", limitUsd: limitNum });
+            }
+          });
+          actions.appendChild(raiseBtn);
+          el.appendChild(actions);
+        }
+        messagesEl.appendChild(el);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+
+      if (kind === "adopt") {
+        const child = body.child || "?";
+        const sha = body.merge_commit || "?";
+        const shortSha = String(sha).slice(0, 7);
+        const el = document.createElement("div");
+        el.className = "event-card adopt";
+        el.textContent = "✓ adopted " + child + " — merge " + shortSha;
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
@@ -1031,17 +1244,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         bodyEl.innerHTML = linkify(body.text || "");
         bindFileLinks(bodyEl);
         el.appendChild(bodyEl);
+        const childId = e.actor.slice(4);
+        if (childId) {
+          const adoptBtn = document.createElement("button");
+          adoptBtn.className = "btn-adopt";
+          adoptBtn.type = "button";
+          adoptBtn.textContent = "Adopt work";
+          adoptBtn.addEventListener("click", () => {
+            vscode.postMessage({ type: "adoptWork", childId });
+          });
+          el.appendChild(adoptBtn);
+        }
         messagesEl.appendChild(el);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return;
       }
     }
 
-    function addMessage(role, text, pending) {
+    function addMessage(role, text, pending, msgAttachments) {
       const el = document.createElement("div");
       el.className = "msg " + role + (pending ? " pending" : "");
       el.innerHTML = linkify(text);
       bindFileLinks(el);
+      if (role === "user" && msgAttachments && msgAttachments.length > 0) {
+        const chips = document.createElement("div");
+        chips.className = "attach-chips";
+        for (const att of msgAttachments) {
+          const name = att.name || att.path || "?";
+          const chip = document.createElement("span");
+          chip.className = "attach-chip-inline";
+          chip.textContent = "📎 " + name;
+          chips.appendChild(chip);
+        }
+        el.appendChild(chips);
+      }
       messagesEl.appendChild(el);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return el;
@@ -1083,12 +1319,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "userMessage":
           clearPending();
-          addMessage("user", msg.text, false);
+          addMessage("user", msg.text, false, msg.attachments);
           break;
         case "filePicked":
-          if (typeof msg.path === "string") {
-            if (!attachments.some((a) => a.path === msg.path)) {
-              attachments.push({ path: msg.path });
+          if (typeof msg.name === "string" && typeof msg.content === "string") {
+            if (!attachments.some((a) => a.name === msg.name)) {
+              attachments.push({ name: msg.name, content: msg.content });
               renderAttachments();
             }
           }
