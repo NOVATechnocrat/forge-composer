@@ -122,8 +122,9 @@ curl -fsS "${AUTH[@]}" "$BASE/roles" | python3 -c '
 import sys, json
 roles = {r["name"]: r for r in json.load(sys.stdin)["roles"]}
 assert "orchestrator" in roles and "architect" in roles, f"roles missing: {list(roles)}"
-assert roles["architect"]["model"] == "stub-architect", f"architect row: {roles[\"architect\"]}"
-assert roles["orchestrator"]["model"] == "stub-m5", f"orchestrator row: {roles[\"orchestrator\"]}"
+arch, orch = roles["architect"], roles["orchestrator"]
+assert arch["model"] == "stub-architect", f"architect row: {arch}"
+assert orch["model"] == "stub-m5", f"orchestrator row: {orch}"
 '
 SID="$(curl -fsS "${AUTH[@]}" -X POST "$BASE/sessions" -H 'Content-Type: application/json' \
   -d "{\"workspace\":\"$WS\",\"role\":\"architect\"}" \
@@ -194,8 +195,9 @@ evs = json.load(sys.stdin)["events"]
 rules = [e for e in evs if e["kind"] == "rules"]
 assert rules, "no rules event on the ledger"
 r = rules[-1]
-assert r["actor"] == "system", f"rules actor: {r[\"actor\"]}"
-assert r["body"].get("path") == "AGENTS.md" and r["body"].get("bytes", 0) > 0, f"rules body: {r[\"body\"]}"
+actor, body = r["actor"], r["body"]
+assert actor == "system", f"rules actor: {actor}"
+assert body.get("path") == "AGENTS.md" and body.get("bytes", 0) > 0, f"rules body: {body}"
 '
 
 echo "== E. bootstrap: composerd init writes once; --version prints =="
