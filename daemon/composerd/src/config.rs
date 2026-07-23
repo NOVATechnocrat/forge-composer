@@ -14,6 +14,8 @@ pub struct Config {
     pub pricing: BTreeMap<String, PriceCfg>,
     #[serde(default)]
     pub budgets: BudgetCfg,
+    #[serde(default)]
+    pub forgeloop: ForgeloopCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -33,6 +35,14 @@ pub struct ProviderCfg {
 pub struct RoleCfg {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub escalation: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ForgeloopCfg {
+    #[serde(default)]
+    pub dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -137,6 +147,24 @@ pub fn resolve_role(cfg: &Config, role: &str) -> anyhow::Result<gateway::Provide
             other => anyhow::bail!("unknown provider kind: {other}"),
         },
     })
+}
+
+/// The role's provider config followed by its escalation tiers, in order.
+/// Each escalation entry naming an unknown role is an `Err` (config bug, fail
+/// loudly at turn start rather than silently rerouting).
+pub fn resolve_chain(
+    cfg: &Config,
+    role: &str,
+) -> anyhow::Result<Vec<(String, gateway::ProviderConfig)>> {
+    let mut out = vec![(role.to_string(), resolve_role(cfg, role)?)];
+    let role_cfg = cfg
+        .roles
+        .get(role)
+        .ok_or_else(|| anyhow::anyhow!("unknown role: {role}"))?;
+    for next in &role_cfg.escalation {
+        out.push((next.clone(), resolve_role(cfg, next)?));
+    }
+    Ok(out)
 }
 
 /// Every resolvable `api_key_env` value currently present in the environment.
@@ -247,5 +275,65 @@ session_usd = 5.0
         let cfg = load_or_init(d.path()).unwrap();
         assert!(cfg.pricing.is_empty());
         assert!(cfg.budgets.session_usd.is_none());
+    }
+
+    #[test]
+    fn forgeloop_dir_and_escalation_chain_parse() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.a]
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.b]
+base_url = "http://127.0.0.1:2/v1"
+
+[roles.orchestrator]
+provider = "a"
+model = "m-a"
+escalation = ["fallback"]
+
+[roles.fallback]
+provider = "b"
+model = "m-b"
+
+[forgeloop]
+dir = "/tmp/fl"
+"#,
+        )
+        .unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert_eq!(cfg.forgeloop.dir.as_deref(), Some(std::path::Path::new("/tmp/fl")));
+        let chain = resolve_chain(&cfg, "orchestrator").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].0, "orchestrator");
+        assert_eq!(chain[0].1.model, "m-a");
+        assert_eq!(chain[1].0, "fallback");
+        assert_eq!(chain[1].1.model, "m-b");
+    }
+
+    #[test]
+    fn escalation_to_unknown_role_errors() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            r#"[server]
+port = 9000
+
+[providers.a]
+base_url = "http://127.0.0.1:1/v1"
+
+[roles.orchestrator]
+provider = "a"
+model = "m-a"
+escalation = ["ghost"]
+"#,
+        )
+        .unwrap();
+        let cfg = load_or_init(d.path()).unwrap();
+        assert!(resolve_chain(&cfg, "orchestrator").is_err());
     }
 }
