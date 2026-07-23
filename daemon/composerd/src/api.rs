@@ -296,11 +296,25 @@ async fn sessions_detail(
         let meta = crate::state::load_meta(&state.state_dir, &id).ok().flatten();
         let events = state.store.read(&id, 0).unwrap_or_default();
         let (mut p, mut c, mut cost) = (0u64, 0u64, 0f64);
+        let mut last_model: Option<String> = None;
+        let mut last_prompt: u64 = 0;
         for e in events.iter().filter(|e| e.kind == "usage") {
             p += e.body.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             c += e.body.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             cost += e.body.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if let Some(m) = e.body.get("model").and_then(|v| v.as_str()) {
+                last_model = Some(m.to_string());
+                last_prompt = e
+                    .body
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
         }
+        let context_window = last_model
+            .as_deref()
+            .and_then(|m| state.cfg.pricing.get(m))
+            .and_then(|pc| pc.context_window);
         let status = if state.is_running(&id) {
             "running"
         } else if state
@@ -312,7 +326,7 @@ async fn sessions_detail(
         } else {
             "idle"
         };
-        out.push(serde_json::json!({
+        let mut row = serde_json::json!({
             "id": id,
             "kind": meta.as_ref().map(|m| m.kind.clone()).unwrap_or_else(|| "orchestrator".into()),
             "parent": meta.as_ref().and_then(|m| m.parent.clone()),
@@ -322,7 +336,15 @@ async fn sessions_detail(
             "prompt_tokens": p,
             "completion_tokens": c,
             "cost_usd": cost,
-        }));
+            "last_prompt_tokens": last_prompt,
+        });
+        if let Some(m) = last_model {
+            row["model"] = serde_json::json!(m);
+        }
+        if let Some(cw) = context_window {
+            row["context_window"] = serde_json::json!(cw);
+        }
+        out.push(row);
     }
     Ok(axum::Json(serde_json::json!({"sessions": out})))
 }

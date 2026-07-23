@@ -948,6 +948,7 @@ fn emit_usage(
     let mut body = serde_json::json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
+        "model": model,
     });
     if let Some(c) = crate::config::cost_usd(cfg, model, prompt, completion) {
         body["cost_usd"] = serde_json::json!(c);
