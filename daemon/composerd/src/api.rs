@@ -33,6 +33,24 @@ pub struct AppState {
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Frame>>>,
     pub approvals:
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    pub controls:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<SessionControl>>>,
+}
+
+/// Per-session control plane: a pause flag the agent loop polls at every tool
+/// boundary, and the abort handle of the currently-running turn task (if any).
+pub struct SessionControl {
+    pub paused: std::sync::atomic::AtomicBool,
+    pub abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl SessionControl {
+    fn new() -> Self {
+        Self {
+            paused: std::sync::atomic::AtomicBool::new(false),
+            abort: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -72,6 +90,38 @@ impl AppState {
             })
             .clone()
     }
+
+    pub fn control_for(&self, session: &str) -> std::sync::Arc<SessionControl> {
+        let mut map = self.controls.lock().unwrap();
+        map.entry(session.to_string())
+            .or_insert_with(|| std::sync::Arc::new(SessionControl::new()))
+            .clone()
+    }
+
+    /// True iff a turn task is currently registered and not yet finished.
+    pub fn is_running(&self, session: &str) -> bool {
+        let ctl = self.control_for(session);
+        let guard = ctl.abort.lock().unwrap();
+        match &*guard {
+            Some(h) => !h.is_finished(),
+            None => false,
+        }
+    }
+}
+
+/// True iff a `message` (from human) or `steer` event is newer than the last
+/// agent reply — i.e. there is input the agent has not yet answered.
+pub fn has_pending_input(events: &[ledger::Event]) -> bool {
+    let last_agent_reply = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "message" && e.actor != "human")
+        .map(|e| e.seq)
+        .unwrap_or(0);
+    events.iter().any(|e| {
+        e.seq > last_agent_reply
+            && (e.kind == "steer" || (e.kind == "message" && e.actor == "human"))
+    })
 }
 
 pub async fn build_router(state: Arc<AppState>) -> Router {
@@ -81,6 +131,11 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/message", post(post_message))
         .route("/sessions/{id}/approve", post(approve))
+        .route("/sessions/{id}/pause", post(pause))
+        .route("/sessions/{id}/resume", post(resume))
+        .route("/sessions/{id}/steer", post(steer))
+        .route("/sessions/{id}/inject", post(inject))
+        .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/checkpoints", get(checkpoints))
         .route("/sessions/{id}/restore", post(restore))
         .route("/sessions/{id}/file_at", get(file_at))
@@ -232,11 +287,14 @@ async fn post_message(
     let ev = state
         .append_event(&id, "human", "message", "trusted", msg_body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let st = state.clone();
-    let idc = id.clone();
-    tokio::spawn(async move {
-        crate::orchestrator::run_turn(st, idc).await;
-    });
+    let ctl = state.control_for(&id);
+    if !ctl.paused.load(std::sync::atomic::Ordering::SeqCst) {
+        let st = state.clone();
+        let idc = id.clone();
+        tokio::spawn(async move {
+            crate::orchestrator::run_turn(st, idc).await;
+        });
+    }
     Ok(axum::Json(serde_json::json!({"seq": ev.seq})))
 }
 
@@ -270,6 +328,119 @@ async fn approve(
         serde_json::json!({"id": body.id, "approved": body.approved, "by": "human"}),
     );
     let _ = tx.send(body.approved);
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+pub struct TextBody {
+    pub text: String,
+}
+
+async fn pause(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    state
+        .control_for(&id)
+        .paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .append_event(&id, "human", "pause", "trusted", serde_json::json!({}))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn resume(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let ctl = state.control_for(&id);
+    ctl.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    state
+        .append_event(&id, "human", "resume", "trusted", serde_json::json!({}))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !state.is_running(&id) {
+        if let Ok(evs) = state.store.read(&id, 0) {
+            if has_pending_input(&evs) {
+                let st = state.clone();
+                let idc = id.clone();
+                tokio::spawn(async move {
+                    crate::orchestrator::run_turn(st, idc).await;
+                });
+            }
+        }
+    }
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn steer(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<TextBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    state
+        .append_event(
+            &id,
+            "human",
+            "steer",
+            "trusted",
+            serde_json::json!({"text": body.text}),
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ctl = state.control_for(&id);
+    if !state.is_running(&id) && !ctl.paused.load(std::sync::atomic::Ordering::SeqCst) {
+        let st = state.clone();
+        let idc = id.clone();
+        tokio::spawn(async move {
+            crate::orchestrator::run_turn(st, idc).await;
+        });
+    }
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn inject(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::Json<TextBody>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    state
+        .append_event(
+            &id,
+            "human",
+            "context_inject",
+            "trusted",
+            serde_json::json!({"text": body.text}),
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn interrupt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.store.session_exists(&id) {
+        return Err((StatusCode::NOT_FOUND, "unknown session".into()));
+    }
+    let ctl = state.control_for(&id);
+    if let Some(h) = ctl.abort.lock().unwrap().take() {
+        h.abort();
+    }
+    state
+        .append_event(&id, "human", "interrupt", "trusted", serde_json::json!({}))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
@@ -330,5 +501,42 @@ async fn file_at(
     match shadow.file_at(&q.hash, &q.path) {
         Ok(content) => Ok(([(header::CONTENT_TYPE, "text/plain")], content).into_response()),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(seq: u64, kind: &str, actor: &str) -> ledger::Event {
+        ledger::Event {
+            v: "forgeloop.composer.event.v1".into(),
+            seq,
+            ts: "t".into(),
+            session: "s".into(),
+            actor: actor.into(),
+            kind: kind.into(),
+            provenance: "trusted".into(),
+            body: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn pending_input_rule() {
+        // human asked, agent answered: nothing pending
+        assert!(!has_pending_input(&[ev(1, "message", "human"), ev(2, "message", "orchestrator")]));
+        // human message after agent reply: pending
+        assert!(has_pending_input(&[
+            ev(1, "message", "human"),
+            ev(2, "message", "orchestrator"),
+            ev(3, "message", "human")
+        ]));
+        // steer after agent reply: pending
+        assert!(has_pending_input(&[ev(1, "message", "orchestrator"), ev(2, "steer", "human")]));
+        // inject alone does NOT wake
+        assert!(!has_pending_input(&[
+            ev(1, "message", "orchestrator"),
+            ev(2, "context_inject", "human")
+        ]));
     }
 }
