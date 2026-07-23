@@ -370,8 +370,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     background: var(--vscode-input-background);
   }
   .msg.assistant {
-    align-self: flex-start;
-    background: var(--vscode-editor-inactiveSelectionBackground);
+    align-self: stretch;
+    max-width: 100%;
+    background: transparent;
+    border-left: 2px solid var(--vscode-panel-border);
+    border-radius: 0;
+    padding-left: 0.6rem;
   }
   .msg.pending { opacity: 0.75; }
   .msg a.file-link {

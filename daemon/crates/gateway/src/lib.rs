@@ -103,6 +103,9 @@ pub async fn chat_stream(
     let mut body = serde_json::json!({
         "model": cfg.model,
         "stream": true,
+        // Without this, OpenAI-compatible servers (Ollama, vLLM, Fireworks)
+        // omit the trailing usage chunk and the ledger records 0/0 tokens.
+        "stream_options": {"include_usage": true},
         "messages": build_openai_messages(messages),
     });
     if let Some(t) = tools {
