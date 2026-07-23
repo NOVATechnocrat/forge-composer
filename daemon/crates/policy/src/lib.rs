@@ -217,6 +217,27 @@ fn hard_deny(argv: &[String]) -> Option<String> {
 }
 
 fn is_readonly(argv: &[String]) -> bool {
+    // Narrowing: a few otherwise-read-only commands become mutating once
+    // certain flags appear, so they fall through to Ask instead of Auto.
+    if let Some(first) = argv.first() {
+        if first == "find" {
+            const FIND_MUTATING: &[&str] = &[
+                "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
+            ];
+            if argv.iter().skip(1).any(|a| FIND_MUTATING.contains(&a.as_str())) {
+                return false;
+            }
+        }
+        if first == "git" && argv.get(1).map(|s| s == "branch").unwrap_or(false) {
+            const BRANCH_MUTATING: &[&str] = &[
+                "-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--force",
+                "--edit-description", "--set-upstream-to", "--unset-upstream",
+            ];
+            if argv.iter().skip(2).any(|a| BRANCH_MUTATING.contains(&a.as_str())) {
+                return false;
+            }
+        }
+    }
     const READONLY: &[&str] = &[
         "ls", "pwd", "rg", "grep", "find", "wc", "head", "tail", "cat", "file",
         "stat", "which",
@@ -285,6 +306,25 @@ mod tests {
         assert_eq!(p.check("cargo build --release"), Verdict::Auto);
         assert!(matches!(p.check("npm install"), Verdict::Deny(_)));
         assert_eq!(p.check("cargo publish"), Verdict::Ask);
+    }
+
+    #[test]
+    fn readonly_commands_with_mutating_args_are_not_auto() {
+        let p = Policy::default();
+        for cmd in [
+            "find . -name canary.txt -delete",
+            "find /tmp -exec rm",
+            "find . -okdir chmod 600",
+            "git branch -D main",
+            "git branch -M old new",
+            "git branch --delete feature",
+        ] {
+            assert_eq!(p.check(cmd), Verdict::Ask, "must not auto-run: {cmd}");
+        }
+        // Genuinely read-only forms stay Auto.
+        assert_eq!(p.check("find . -name canary.txt"), Verdict::Auto);
+        assert_eq!(p.check("git branch --list"), Verdict::Auto);
+        assert_eq!(p.check("git branch"), Verdict::Auto);
     }
 
     #[test]
