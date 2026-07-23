@@ -35,10 +35,11 @@ Two components:
 
 ## Status
 
-M0 (Spine) + M1 (Hands) loop-gated. Dogfood via `bash scripts/dogfood-codium.sh`
-(isolated VSCodium profile — does not touch your Cursor session).
+M0 (Spine) + M1 (Hands) + M2 (Orchestra) loop-gated. Dogfood via
+`bash scripts/dogfood-codium.sh` (isolated VSCodium profile — does not touch
+your Cursor session).
 
-M2 (Orchestra) is next.
+M3 (Physics — oracle-draft workflow, Judge bridge, verdict events) is next.
 
 ## License
 
