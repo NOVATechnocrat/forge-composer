@@ -19,6 +19,30 @@
       {
         "command": "forgeComposer.open",
         "title": "Forge Composer: Open"
+      },
+      {
+        "command": "forgeComposer.openSession",
+        "title": "Forge Composer: Open Session"
+      },
+      {
+        "command": "forgeComposer.pauseSession",
+        "title": "Forge Composer: Pause Session"
+      },
+      {
+        "command": "forgeComposer.resumeSession",
+        "title": "Forge Composer: Resume Session"
+      },
+      {
+        "command": "forgeComposer.steerSession",
+        "title": "Forge Composer: Steer Session"
+      },
+      {
+        "command": "forgeComposer.injectContext",
+        "title": "Forge Composer: Inject Context"
+      },
+      {
+        "command": "forgeComposer.interruptSession",
+        "title": "Forge Composer: Interrupt Session (hard stop)"
       }
     ],
     "viewsContainers": {
@@ -36,6 +60,10 @@
           "type": "webview",
           "id": "forgeComposer.chat",
           "name": "Composer"
+        },
+        {
+          "id": "forgeComposer.sessions",
+          "name": "Sessions"
         }
       ]
     }

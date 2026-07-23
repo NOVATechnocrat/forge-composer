@@ -92,6 +92,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.initSession(webviewView.webview);
   }
 
+  async openSession(id: string): Promise<void> {
+    if (!this.client || !this.view) {
+      return;
+    }
+    this.session = id;
+    try {
+      await this.loadSession();
+    } catch (err) {
+      this.view.webview.postMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "failed to open session",
+      });
+    }
+  }
+
   getSession(): string | undefined {
     return this.session;
   }
@@ -117,21 +132,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.client!.fileAt(session, hash, path)
       );
 
-      const events = await this.client.events(this.session, 0);
-      webview.postMessage({ type: "init", session: this.session, events });
-
-      this.disposeStream?.();
-      this.disposeStream = this.client.stream(
-        this.session,
-        (e) => this.onLedger(e),
-        (t) => this.onDelta(t)
-      );
+      await this.loadSession(webview);
     } catch (err) {
       webview.postMessage({
         type: "error",
         text: err instanceof Error ? err.message : "failed to connect",
       });
     }
+  }
+
+  private async loadSession(webview?: vscode.Webview): Promise<void> {
+    const wv = webview ?? this.view?.webview;
+    if (!this.client || !this.session || !wv) {
+      return;
+    }
+
+    this.pendingDelta = "";
+    this.disposeStream?.();
+
+    const events = await this.client.events(this.session, 0);
+    wv.postMessage({ type: "init", session: this.session, events });
+
+    this.disposeStream = this.client.stream(
+      this.session,
+      (e) => this.onLedger(e),
+      (t) => this.onDelta(t)
+    );
   }
 
   private async handleSend(
