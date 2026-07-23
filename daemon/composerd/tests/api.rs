@@ -3,8 +3,6 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use composerd::testkit;
@@ -12,8 +10,6 @@ use composerd::testkit;
 fn spawn_stub() -> String {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    let _ = STARTED.store(true, Ordering::SeqCst);
     std::thread::spawn(move || {
         for _ in 0..16 {
             let (mut s, _) = match l.accept() {
@@ -155,5 +151,4 @@ model = "stub-model"
     assert!(count >= 3, "prior events must survive reattach; got {count}");
 
     handle2.abort();
-    let _ = Arc::new(()); // keep `Arc` import used
 }

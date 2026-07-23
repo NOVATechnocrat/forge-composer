@@ -66,7 +66,7 @@ pub async fn run_turn(state: Arc<AppState>, session: String) {
     let state_for_delta = state.clone();
     let session_for_delta = session.clone();
     let result = gateway::chat_stream(&cfg, &messages, |d| {
-        state_for_delta.broadcast(&session_for_delta, crate::Frame::Delta(d.to_string()));
+        state_for_delta.broadcast(&session_for_delta, crate::api::Frame::Delta(d.to_string()));
     })
     .await;
 

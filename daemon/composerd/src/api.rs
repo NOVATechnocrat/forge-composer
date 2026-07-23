@@ -110,9 +110,6 @@ pub async fn auth_middleware(
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct CreateBody {}
-
 async fn create_session(
     State(state): State<Arc<AppState>>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
@@ -133,7 +130,7 @@ async fn list_sessions(
     Ok(axum::Json(serde_json::json!({"sessions": sessions})))
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct SinceQuery {
     since: Option<u64>,
 }

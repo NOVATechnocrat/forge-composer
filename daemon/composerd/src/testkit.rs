@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
-use crate::api::{build_router, AppState, Frame};
+use crate::api::{build_router, AppState};
 use crate::config;
 use crate::state as st;
 
@@ -23,7 +23,6 @@ pub async fn serve() -> (SocketAddr, JoinHandle<()>) {
         cfg,
         channels: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
-    let _ = Frame::Delta(String::new()); // silence unused variant in some configs
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

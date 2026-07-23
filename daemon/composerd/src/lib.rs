@@ -8,4 +8,4 @@ pub mod state;
 #[doc(hidden)]
 pub mod testkit;
 
-pub use api::{ct_eq, AppState, Frame};
+pub use api::{ct_eq, AppState};
