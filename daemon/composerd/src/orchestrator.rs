@@ -51,6 +51,30 @@ pub fn session_shadow(
     Ok((shadow, jail))
 }
 
+/// Read `<jail_root>/AGENTS.md` for folding into the SYSTEM prompt. Returns None
+/// when absent or empty. Capped at 32 KiB: bytes beyond the cap are dropped and
+/// a `\n[rules truncated]` marker is appended. Returns `(text, loaded_bytes)`.
+fn load_agents_md(jail_root: &std::path::Path) -> Option<(String, u64)> {
+    const RULES_CAP: usize = 32_768;
+    let path = jail_root.join("AGENTS.md");
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let (loaded, truncated) = if bytes.len() > RULES_CAP {
+        (bytes[..RULES_CAP].to_vec(), true)
+    } else {
+        (bytes, false)
+    };
+    let mut text = String::from_utf8_lossy(&loaded).into_owned();
+    if truncated {
+        text.push_str("\n[rules truncated]");
+    }
+    // bytes = the number of file bytes actually loaded into the prompt (capped).
+    let loaded_bytes = loaded.len() as u64;
+    Some((text, loaded_bytes))
+}
+
 pub fn run_turn(
     state: Arc<AppState>,
     session: String,
@@ -105,6 +129,32 @@ async fn run_turn_inner(state: &Arc<AppState>, session: &str) -> anyhow::Result<
     let ctl = state.control_for(session);
 
     let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
+    // Workspace rules: if <jail_root>/AGENTS.md exists and is non-empty, fold it
+    // into the SYSTEM prompt under an explicit label (house rules are trusted
+    // instructions, unlike tool output) and ledger a `rules` event so the human
+    // can see what the agents were told. Re-read every turn (the file may
+    // change); re-emit the event only when the loaded byte count changes.
+    if let Some((rules_text, rules_bytes)) = load_agents_md(meta.jail_root()) {
+        messages[0]
+            .content
+            .push_str("\n\nWorkspace rules (AGENTS.md):\n");
+        messages[0].content.push_str(&rules_text);
+        let prev_bytes = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == "rules")
+            .and_then(|e| e.body.get("bytes").and_then(|v| v.as_u64()))
+            .unwrap_or(u64::MAX);
+        if prev_bytes != rules_bytes {
+            let _ = state.append_event(
+                session,
+                "system",
+                "rules",
+                "trusted",
+                serde_json::json!({"path": "AGENTS.md", "bytes": rules_bytes}),
+            );
+        }
+    }
     // Bounded history fold: keep only the most recent `max_fold_events` foldable
     // events; when history exceeds the cap, drop the older ones and prepend an
     // explicit truncation marker so nothing is silently lost.
