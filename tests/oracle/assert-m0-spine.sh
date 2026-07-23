@@ -100,9 +100,10 @@ done
 [ "$OK" = 1 ] || fail "no orchestrator reply with stub sentinel within 10s"
 
 echo "== event invariants: schema v1 everywhere, usage present =="
-events_json | python3 - <<'PY' || exit 1
+events_json > "$STATE/events-snapshot.json"
+python3 - "$STATE/events-snapshot.json" <<'PY' || exit 1
 import sys, json
-data = json.load(sys.stdin)
+data = json.load(open(sys.argv[1]))
 evs = data["events"]
 assert evs, "no events"
 for e in evs:
@@ -124,8 +125,8 @@ fi
 grep -rq "\[REDACTED\]" "$STATE/sessions" || fail "no [REDACTED] marker in ledger"
 
 echo "== CLI readback == API readback =="
-API_NORM="$(events_json | python3 -c 'import sys,json;print("\n".join(f"{e[\"seq\"]}|{e[\"kind\"]}|{e[\"actor\"]}" for e in json.load(sys.stdin)["events"]))')"
-CLI_NORM="$(FORGE_COMPOSER_STATE_DIR="$STATE" "$BIN" ledger "$SID" | python3 -c 'import sys,json;print("\n".join(f"{e[\"seq\"]}|{e[\"kind\"]}|{e[\"actor\"]}" for e in (json.loads(l) for l in sys.stdin if l.strip())))')"
+API_NORM="$(events_json | python3 -c 'import sys,json;print("\n".join("|".join([str(e["seq"]),e["kind"],e["actor"]]) for e in json.load(sys.stdin)["events"]))')"
+CLI_NORM="$(FORGE_COMPOSER_STATE_DIR="$STATE" "$BIN" ledger "$SID" | python3 -c 'import sys,json;print("\n".join("|".join([str(e["seq"]),e["kind"],e["actor"]]) for e in (json.loads(l) for l in sys.stdin if l.strip())))')"
 [ -n "$API_NORM" ] || fail "empty API readback"
 [ "$API_NORM" = "$CLI_NORM" ] || fail "CLI readback != API readback"$'\nAPI:\n'"$API_NORM"$'\nCLI:\n'"$CLI_NORM"
 

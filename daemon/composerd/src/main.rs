@@ -25,10 +25,10 @@ fn main() {
             }
         }
         "serve" => {
-            // M0: the HTTP server is exercised via the testkit in tests; the bare
-            // binary prints a banner for now. Full serve wiring lands with the
-            // extension integration milestone.
-            println!("composerd 0.1.0 — M0 spine; see docs/superpowers/specs/");
+            if let Err(e) = run_serve() {
+                eprintln!("composerd: {e}");
+                std::process::exit(1);
+            }
         }
         other => {
             eprintln!("unknown subcommand: {other}");
@@ -40,6 +40,17 @@ fn main() {
 
 fn state_dir() -> PathBuf {
     composerd::state::state_dir()
+}
+
+fn run_serve() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let dir = composerd::state::state_dir();
+        let (addr, handle) = composerd::serve::bind_and_serve(&dir, None).await?;
+        println!("composerd 0.1.0 listening on http://{addr}");
+        handle.await?;
+        Ok(())
+    })
 }
 
 fn cmd_sessions() -> Result<(), i32> {

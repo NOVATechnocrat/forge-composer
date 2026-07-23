@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod orchestrator;
+pub mod serve;
 pub mod state;
 
 #[doc(hidden)]
